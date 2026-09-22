@@ -69,7 +69,10 @@ def test_residual_warmup_schedule():
     """T4.2：η/λ 从 0 ramp 至 1；frac=0 时与旧路径锚点一致。"""
     from trainer.residual_schedule import residual_progress, apply_residual_progress
     assert residual_progress(0, 100) == 0.0
-    assert abs(residual_progress(50, 100) - 0.5) < 1e-9
+    # V2 §14.2：前 20% 窗口 0→0.25，后 80% 0.25→1
+    assert abs(residual_progress(20, 100) - 0.25) < 1e-9   # t=0.2 → 0.25
+    assert abs(residual_progress(10, 100) - 0.125) < 1e-9  # 线性到 0.25 的一半
+    assert abs(residual_progress(60, 100) - 0.625) < 1e-9  # 0.25+0.75*0.5
     assert residual_progress(999, 100) == 1.0
     torch.manual_seed(2)
     m = MiniMindXForCausalLM(_v2_cfg())

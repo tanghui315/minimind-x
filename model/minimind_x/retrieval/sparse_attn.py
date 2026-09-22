@@ -50,27 +50,32 @@ class SparseBlockAttention(Attention):
         # query 与块键的相似度：[B, H, S, n_blk]
         blk_score = torch.einsum("bhsd,bhnd->bhsn",
                                  F.normalize(xq, dim=-1), F.normalize(block_k, dim=-1))
-        # ---- T0.4（C8 修复）：块选择因果化 + 最终掩码取交集 ----
-        # query i（全局位）可见 key 满足 col ≤ i；块 b 的 key 起始于 b*block，
-        # 故「块含至少一个可见 key」⟺ blk_start(b) ≤ i —— 逐行块可见性 [S, n_blk]
+        # ---- 评审 9.5 / T0.4：块级因果 ----
+        # 块键 = 全块 mean 会混入未来 token；即使 attention mask 挡住未来 value，
+        # 未来内容仍会改变「选哪些块」。修复：
+        #   全局 top-k 只允许「完整可见块」（块末 < query 位）——其 key 无未来污染；
+        #   当前未完成块（块末 ≥ query）不参与全局选择，仅走因果局部窗口。
         blk_start = torch.arange(n_blk, device=x.device) * self.block
+        blk_end = blk_start + self.block  # 开区间块末
         row_g = torch.arange(total_len - seq_len, total_len, device=x.device)
-        blk_vis_rows = blk_start.unsqueeze(0) <= row_g.unsqueeze(1)          # [S, n_blk]
+        # 完整可见：块末 ≤ query+1（块内所有 key 均 ≤ query）
+        blk_fully_vis = blk_end.unsqueeze(0) <= (row_g + 1).unsqueeze(1)    # [S, n_blk]
         blk_score = blk_score.masked_fill(
-            ~blk_vis_rows.unsqueeze(0).unsqueeze(0), float("-inf"))
+            ~blk_fully_vis.unsqueeze(0).unsqueeze(0), float("-inf"))
         k_sel = min(self.n_selected, n_blk)
         sel = blk_score.topk(k_sel, dim=-1).indices                    # [B,H,S,k]
-        # 逐 head 选块的并集（研究级近似：union over heads）
         block_mask = torch.zeros(bsz, self.n_local_heads, seq_len, n_blk,
                                  device=x.device, dtype=torch.bool).scatter_(-1, sel, True)
-        col_block = torch.arange(total_len, device=x.device) // self.block  # key 的块号
+        # 强制排除未完整可见块（topk 可能捡到 -inf 槽）
+        block_mask = block_mask & blk_fully_vis.unsqueeze(0).unsqueeze(0)
+        col_block = torch.arange(total_len, device=x.device) // self.block
         allow_blocks = block_mask.any(dim=1, keepdim=True)[..., col_block]  # [B,1,S,total]
 
-        # ---- 窗口 + 因果（修复：选择并集后再与因果取交集，块选择不得越过因果线）----
+        # 窗口 + 因果：未完成块的 key 只能靠 band 进入；最终仍与因果取交集
         row = torch.arange(total_len - seq_len, total_len, device=x.device).unsqueeze(1)
         col = torch.arange(total_len, device=x.device).unsqueeze(0)
         band = (col <= row) & (col > row - self.window)
-        causal = col <= row                                                 # [S, total]
+        causal = col <= row
         allow = (allow_blocks | band.unsqueeze(0).unsqueeze(0)) & causal.unsqueeze(0).unsqueeze(0)
         scores = (xq @ xk_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(~allow, float("-inf"))

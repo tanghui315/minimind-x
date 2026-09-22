@@ -20,10 +20,10 @@ from typing import Optional
 import torch
 
 from .retrieval.block_store import LongContextStore
-from .memory.working_memory import WorkingMemory
+from .memory.working_memory import WorkingMemory, MemoryInput
 from .router.retrieval_router import (
     ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH, ACTION_NAMES,
-    action_mask)
+    action_mask, normalize_oracle_actions, ACTION_SCHEMA_VERSION)
 
 
 
@@ -61,7 +61,11 @@ class AdaptiveController:
     # ---------------------------------------------------------------- 建库与初检
     def begin(self, context_ids):
         self.store = LongContextStore(context_ids, self.cfg.block_size)
-        self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
+        if self.store.n_blocks == 0:
+            # no_evidence 族：空库合法（G1/评审 6.3）——不建索引，检索将返回空 memory
+            self.store.block_keys = None
+        else:
+            self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
         self.memory = None
         self.stats = {"retrievals": 0, "memory_tokens": 0, "re_retrievals": 0,
                       "budget_cap_tokens": 0, "actual_valid_tokens": 0, "unique_blocks": 0,
@@ -95,6 +99,26 @@ class AdaptiveController:
         budget_idx = self.cfg.default_budget_idx if budget_idx is None else budget_idx
         is_initial = mem is None
         budget_blocks = self.cfg.budget_blocks(budget_idx)
+        if self.store.n_blocks == 0 or self.store.block_keys is None:
+            # 空库：合法 no-op memory（评审 6.3）
+            mem = mem if mem is not None else WorkingMemory(
+                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.block_size,
+                                       self.cfg.hidden_size),
+                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
+            self.stats["retrievals"] += 1
+            self.stats["global_refresh"] = self.stats.get("global_refresh", 0) + 1
+            self.stats["memory_tokens"] = mem.token_size
+            self.stats["actual_valid_tokens"] = mem.token_size
+            self.stats["unique_blocks"] = 0
+            self.stats["budget_cap_tokens"] = self.cfg.memory_budgets[budget_idx]
+            self.stats["last_result"] = None
+            self.stats["last_global_result"] = None
+            self.warm_candidates = None
+            if is_initial:
+                self._trace("initial_retrieval", budget_idx=budget_idx,
+                            cap_tokens=self.stats["budget_cap_tokens"],
+                            valid_tokens=0, unique=0)
+            return mem
         result = self.raw.model.retriever.retrieve(
             query_hidden, self.store, self.raw, topk_fine=budget_blocks)  # T0.3 联动
         self.stats["retrievals"] += 1
@@ -116,7 +140,8 @@ class AdaptiveController:
             query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
         hit = torch.ones_like(result.block_idx, dtype=torch.float)  # 新块本轮均被使用
         mem, _, _ = self.raw.model.memory_manager.update(
-            mem, result.block_hidden, block_keys, q_vec, budget_blocks, hit_new=hit)
+            mem, result.block_hidden, block_keys, q_vec, budget_blocks, hit_new=hit,
+            source_ids=result.block_idx)
         self.stats["memory_tokens"] = mem.token_size
         self.stats["actual_valid_tokens"] = mem.token_size
         self.stats["unique_blocks"] = int(result.block_idx[:, 0].numel() and
@@ -165,7 +190,8 @@ class AdaptiveController:
             query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
         hit = torch.ones_like(final_idx, dtype=torch.float)
         mem, _, _ = self.raw.model.memory_manager.update(
-            mem, final_hidden, block_keys, q, budget_blocks, hit_new=hit)
+            mem, final_hidden, block_keys, q, budget_blocks, hit_new=hit,
+            source_ids=final_idx)
         self.stats["retrievals"] += 1
         self.stats["warm_rescore"] = self.stats.get("warm_rescore", 0) + 1
         self.stats["memory_tokens"] = mem.token_size
@@ -234,18 +260,16 @@ class AdaptiveController:
         def cb(r, exit_hidden):
             """轮间动作（T2.5）：REUSE / RESCORE_WARM / GLOBAL_REFRESH。
 
-            oracle_retrieve 支持两种口径：
-              · 0/1 列表（旧）：0=REUSE，1=GLOBAL_REFRESH
-              · 0/1/2 列表（V2）：三动作 id
+            oracle_retrieve 必须已是 schema v2 枚举（0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH）。
+            旧二值标签请先经 normalize_oracle_actions(..., schema_version=1) 转换，禁止在此对调。
             无 oracle 时用 RetrievalRouter.action_logits（RESCORE_WARM 无 warm cache 则 mask）。
             """
             vis = exit_hidden[:, :query_len] if query_len else exit_hidden
             warm_ok = self.has_warm_cache()
             if oracle_retrieve is not None and r < len(oracle_retrieve):
-                raw_a = int(oracle_retrieve[r])
-                # 旧 0/1 口径映射：1 → GLOBAL_REFRESH（保持既有语义）
-                action = ACTION_GLOBAL_REFRESH if raw_a == 1 else (
-                    ACTION_RESCORE_WARM if raw_a == 2 else ACTION_REUSE)
+                action = int(oracle_retrieve[r])  # 已是 schema v2，禁止再映射
+                if action not in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+                    raise ValueError(f"oracle 动作非法: {action}（须先 normalize）")
                 if action == ACTION_RESCORE_WARM and not warm_ok:
                     action = ACTION_GLOBAL_REFRESH  # oracle 也不允许无缓存 RESCORE
                 a_logp = None
@@ -303,7 +327,8 @@ class AdaptiveController:
             payload = self.memory.token_hidden()                    # [B, M, D]
             # T3.3：token 级 valid 来自 WorkingMemory.valid（块级扩展）
             valid = self.memory.token_valid()
-            return (payload, valid)
+            return MemoryInput(payload, valid,
+                               memory_version=self.memory.memory_version)
         return self.memory.get_kv(self.raw.model.thinking_core)
 
     # ---------------------------------------------------------------- 训练入口（SFT-C）
@@ -312,12 +337,18 @@ class AdaptiveController:
                              oracle_r=None, distill=True, query_len=None):
         """SFT-C / Stage 3 的 teacher-forced 终局训练前向（D5 + T0.1/T0.7）。
 
-        query_len: 可见前缀边界（必须由调用方提供；初始检索与 gold CE 重算只用
+        query_len: 可见前缀边界（训练路径必填；初始检索与 gold CE 重算只用
         input_ids[:, :query_len]，换 gold completion 不改变检索——因果契约）。
         返回 (MiniMindXOutput, extras)。
         """
         if query_len is None:
-            query_len = input_ids.shape[1]  # 兼容旧行为（推理/全可见）；训练路径应显式传
+            is_training = bool(getattr(self.model, "training", False)
+                               or getattr(self.raw, "training", False))
+            if is_training:
+                raise ValueError(
+                    "forward_with_oracles 训练路径必须显式传 query_len（禁止默认全序列，"
+                    "否则检索/RB 路由会读到 gold answer）")
+            query_len = input_ids.shape[1]  # 纯推理/全可见
         causal_ids = input_ids[:, :query_len]
         self.begin(context_ids)
         q_hidden = self.raw.model.prelude_hidden(causal_ids, attention_mask[:, :query_len]
@@ -326,8 +357,9 @@ class AdaptiveController:
         with torch.no_grad():  # D5：memory 构建/选择路径不回传梯度
             self.memory = self.retrieve_into_memory(q_hidden, budget_idx=budget_idx)
             mem_input = self._memory_input()
+        # 动作 schema：调用方传入的 oracle_retrieve 一律视为 v2；旧 0/1 由 sft 边界转换
         cb = self.make_loop_callback(oracle_retrieve=oracle_retrieve, query_len=query_len)
-        fwd = dict(collect_exits=True, loop_callback=cb)
+        fwd = dict(collect_exits=True, loop_callback=cb, query_len=query_len)
         if getattr(self.cfg, "residual_v2", False):
             fwd["memory_payload"] = mem_input
         else:
@@ -354,7 +386,8 @@ class AdaptiveController:
             extras["retrieval_action_masks"] = out.router_probs.get("retrieval_action_mask")
         # ---- T0.7：监督项用 grad mode 重算的 logits（离散选择仍 no_grad）----
         zero = None
-        if gold_block_idx is not None or distill:
+        # 空库（no_evidence）：无检索监督可算
+        if (gold_block_idx is not None or distill) and self.store.n_blocks > 0:
             q_grad = self.raw.model.prelude_hidden(
                 causal_ids, attention_mask[:, :query_len]
                 if attention_mask is not None else None, no_grad=False)

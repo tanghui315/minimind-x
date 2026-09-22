@@ -132,6 +132,10 @@ class MiniMindXConfig(PretrainedConfig):
         self.topk_coarse = kwargs.get("topk_coarse", 64)
         self.topk_fine = kwargs.get("topk_fine", 8)
         self.retrieve_query_pool = kwargs.get("retrieve_query_pool", "mean")
+        # Frozen Index 范式（外部百万 token 记忆）：建库时 key encoder 冻结，
+        # 训练只优化 query encoder + ranking；见 V2 §13 / 评审 8.5 分
+        self.freeze_key = bool(kwargs.get("freeze_key", True))
+        self.key_refresh_interval = int(kwargs.get("key_refresh_interval", 0))  # 0=永不周期刷新
 
         # ---- 分区注意力（Doc 1 §19）----
         self.prelude_attn = kwargs.get("prelude_attn", "full")   # "full" | "local" | "sparse"
@@ -149,6 +153,7 @@ class MiniMindXConfig(PretrainedConfig):
         self.alpha_consistency = kwargs.get("alpha_consistency", 0.1)
         self.exit_loss_weighting = kwargs.get("exit_loss_weighting", "uniform")  # uniform | last
         self.oracle_epsilon = kwargs.get("oracle_epsilon", 0.05)
+        self.lambda_cost = kwargs.get("lambda_cost", 0.0)  # T4.4：C(τ) 权重（默认仅日志）
 
         # ---- V2 残差改造（任务清单 P2；V2 文档 §19 配置）----
         self.residual_v2 = kwargs.get("residual_v2", False)  # 总开关；False=旧路径（回归锚点）
@@ -199,6 +204,8 @@ class MiniMindXConfig(PretrainedConfig):
             errors.append("memory_budgets 须为正且递增")
         if not (0 <= self.default_budget_idx < len(self.memory_budgets)):
             errors.append("default_budget_idx 越界")
+        if self.freeze_key and self.key_refresh_interval < 0:
+            errors.append("key_refresh_interval 不得为负")
         if errors:
             raise ValueError("MiniMindXConfig 非法:\n- " + "\n- ".join(errors))
         return True

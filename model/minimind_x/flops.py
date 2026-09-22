@@ -51,8 +51,9 @@ def estimate_flops(config, seq_len, loops=1, memory_blocks=0, n_retrievals=0,
     qh = getattr(config, "reader_query_heads", None) or max(2, d // 64)
     kvh = getattr(config, "reader_kv_heads", 2)
     hd = getattr(config, "reader_head_dim", 64)
-    reader_qo = (T * R) * 2 * (d * qh * hd + qh * hd * d)
-    reader_kv = 2 * (d * kvh * hd) * max(1, mem_tokens and 1)  # 一次投影
+    # 评审 9.4：投影按 T×M 与 M 计（不是常数）；K/V 一次/版本，Q/O 逐轮
+    reader_qo = (T * R) * 2 * seq_len * (d * qh * hd + qh * hd * d)  # Q/O 投影 ~ T·S
+    reader_kv = 2 * mem_tokens * (d * kvh * hd)  # K/V 投影 ~ M（每 memory version 一次）
     reader_gate = (T * R) * 2 * (2 * d * 32 + 32)  # gate_fc1/2 近似
     # MHAR：来源轴加权 O(B·T·D·N_src)，N_src≈R
     mhar = (T * R) * (d * (R + 1))
@@ -70,4 +71,5 @@ def estimate_flops(config, seq_len, loops=1, memory_blocks=0, n_retrievals=0,
             "reader_attn": float(reader_attn), "reader_proj": float(reader_qo + reader_kv),
             "reader_gate": float(reader_gate), "mhar": float(mhar),
             "update_gate": float(update_gate), "residual_modules": float(residual),
-            "effective_depth": P + C + T * R}
+            "effective_depth": P + C + T * R,
+            "executed_core_rounds_note": "executed=R×T（物理）；selected 见 generate stats.avg_loops"}

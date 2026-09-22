@@ -149,8 +149,10 @@ def rollout_group(prompt_text, num_generations, max_new_tokens):
 
 def compute_per_token_logps(model_, input_ids, n_keep, attention_mask=None, num_loops=1):
     """num_loops 与轨迹实际轮数对齐（否则 off-policy 偏差：生成用自适应 R、评估用 R=1）。"""
-    unwrapped = model_.module if isinstance(model_, DistributedDataParallel) else model_
-    logits = unwrapped(input_ids, attention_mask=attention_mask, num_loops=num_loops,
+    # 评审 8.2：梯度前向必须走 DDP 包装（unwrap 会丢梯度同步）
+    # 推理/无梯度可用 raw；此处要 backward，故用 model_ 本身
+    target = model_ if isinstance(model_, DistributedDataParallel) else model_
+    logits = target(input_ids, attention_mask=attention_mask, num_loops=num_loops,
                        logits_to_keep=n_keep + 1).logits[:, :-1, :]
     logps = []
     for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
@@ -177,13 +179,21 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
         for i, ro in enumerate(rollouts):
             base = prompt_base_ids[i]
             for j in range(args.num_generations):
-                traj.append((i, torch.cat([base, ro["ids"][j].cpu()]).to(args.device), ro))
+                # 评审 8.3：两侧先到 CPU 再 cat，避免 CUDA 跨设备
+                traj.append((i, torch.cat([base.cpu(), ro["ids"][j].cpu()]).to(args.device), ro))
         old_per_token, logp_lens, traj_loops = [], [], []
         with torch.no_grad():
             for (i, ids, ro) in traj:
                 n_keep = ids.numel() - prompt_base_ids[i].numel()
                 j = len(old_per_token) % args.num_generations
-                r = max(1, int(round(ro["loop"][j])))  # 轨迹实际轮数对齐
+                # 评审 8.3/V2 §17.3：禁止平均深度重放（[1,3,2,4] 不得用 R=3 近似）
+                # adaptive 轨迹内 token 深度不同时，不得 int(round(avg_loops))
+                raw_loop = ro["loop"][j]
+                r = max(1, int(round(raw_loop)))
+                if abs(raw_loop - r) > 1e-6 and getattr(args, "allow_avg_depth_replay", 0) != 1:
+                    raise RuntimeError(
+                        f"禁平均深度重放：avg_loops={raw_loop} 非整数（V2 §17.3）。"
+                        f"请用固定 R rollout，或显式 --allow_avg_depth_replay 1（消融，不诚实）")
                 old_per_token.append(compute_per_token_logps(model, ids.unsqueeze(0), n_keep, num_loops=r)[0])
                 logp_lens.append(n_keep)
                 traj_loops.append(r)
@@ -265,6 +275,8 @@ if __name__ == "__main__":
                         help="RL 课程：1 无惩罚 / 2 小惩罚 / 3 Pareto（Doc 5 §24）")
     parser.add_argument("--mode_diversity", default=1, type=int, choices=[0, 1],
                         help="轨迹按 fast/normal/deep 模式循环采样")
+    parser.add_argument("--allow_avg_depth_replay", default=0, type=int, choices=[0, 1],
+                        help="危险：允许平均深度近似重放（V2 §17.3 禁止；仅消融）")
     parser.add_argument("--adaptive_rollout", default=0, type=int, choices=[0, 1],
                         help="0=固定采样 R（默认，on-policy）；1=adaptive halting rollout"
                              "（logps 用单一 R 近似，残余 off-policy 偏差，消融用）")
@@ -276,6 +288,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=None, type=int, help='默认 None：不覆盖 preset/variant 默认（T0.6）')
     parser.add_argument('--num_hidden_layers', default=None, type=int, help='默认 None：不覆盖 preset/variant 默认（T0.6）')
     parser.add_argument('--max_loop', default=4, type=int)
+    parser.add_argument('--residual_v2', default=0, type=int, choices=[0, 1],
+                        help='V2 残差改造；从 V2 ckpt 加载时会自动强制打开')
     parser.add_argument("--data_path", type=str, default="../dataset/agent_rl_math.jsonl",
                         help="math RL 数据：{conversations, gt}（官方 agent_rl_math.jsonl）")
     parser.add_argument("--reward_type", type=str, default="math", choices=["math", "code"],
@@ -293,6 +307,7 @@ if __name__ == "__main__":
     setup_seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindXConfig(preset=args.preset, variant=args.variant, max_loop=args.max_loop,
+                                residual_v2=bool(args.residual_v2),
                                 **{k: v for k, v in dict(hidden_size=args.hidden_size,
                                                          num_hidden_layers=args.num_hidden_layers).items() if v is not None})
     device_type = "cuda" if "cuda" in args.device else "cpu"

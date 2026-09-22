@@ -5,7 +5,11 @@
   Fine：候选块内 token 级 max-sim 重排（late-interaction 式）→ TopK_f 个最终块
 
 监督：合成 needle 数据自带 gold block 标注 → coarse 分数做 CE（retrieval CE）。
-TopK 不可微（D5），梯度只走 query/key 投影的 CE 路径。
+TopK 不可微（D5）。**Frozen Index 范式**：LongContextStore 建库阶段在 no_grad 下
+用 key_proj 生成库 key；训练阶段梯度只走 **query 投影** 的 CE/蒸馏路径，
+key_proj 不获得梯度（不是 bug，是可缓存索引 + 推理效率的设计选择）。
+配置声明 config.freeze_key=True；若要 Q/K 联合训练，须周期 rebuild index
+（key_refresh_interval），不能只去掉 no_grad。
 """
 from dataclasses import dataclass
 from typing import Optional

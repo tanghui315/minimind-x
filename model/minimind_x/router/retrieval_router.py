@@ -15,6 +15,27 @@ ACTION_RESCORE_WARM = 1
 ACTION_GLOBAL_REFRESH = 2
 ACTION_NAMES = ("REUSE", "RESCORE_WARM", "GLOBAL_REFRESH")
 ACTION_COUNT = 3
+# 唯一合法枚举（V2 §9.2）；旧二值标签只在数据边界转换一次
+ACTION_SCHEMA_VERSION = 2
+
+
+def normalize_oracle_actions(seq, schema_version: int = ACTION_SCHEMA_VERSION):
+    """把 oracle 动作序列归一到 schema v2：0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH。
+
+    schema v1（旧二值）：0=REUSE, 1=GLOBAL_REFRESH（无 RESCORE_WARM）。
+    进入模型后禁止再转换（Oracle/loss/执行/trace 共用本枚举）。
+    """
+    out = []
+    for a in seq or []:
+        a = int(a)
+        if schema_version <= 1:
+            # v1: 0=REUSE, 1=REFRESH → v2: 0=REUSE, 2=GLOBAL_REFRESH
+            out.append(ACTION_REUSE if a == 0 else ACTION_GLOBAL_REFRESH)
+        else:
+            if a not in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+                raise ValueError(f"非法动作 id {a}（schema v{schema_version}）")
+            out.append(a)
+    return out
 
 
 def action_mask(warm_available: bool, device=None, batch: int = 1) -> torch.Tensor:

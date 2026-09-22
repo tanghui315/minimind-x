@@ -38,16 +38,31 @@ def gen_sample(rng, n_files, funcs_per_file, ctx_tokens, block_size):
     # 截断/填充到目标长度
     if len(ctx) > ctx_tokens * 4:
         ctx = ctx[:ctx_tokens * 4]
-    bug_fn = [l.split("(")[0][4:] for l in files[target_file].splitlines()
-              if l.startswith("def ")]
-    fn = rng.choice(bug_fn) if bug_fn else "main"
+    # 真值修正：从源码解析真实函数名与参数，patch 不得使用未定义的 args/省略号
+    defs = []
+    for l in files[target_file].splitlines():
+        if l.startswith("def "):
+            head = l.split("(")[0][4:].strip()
+            params = l.split("(", 1)[1].rsplit(")", 1)[0] if "(" in l else ""
+            arg_names = [p.split(":")[0].strip() for p in params.split(",") if p.strip()]
+            defs.append((head, arg_names))
+    if not defs:
+        defs = [("main", [])]
+    fn, arg_names = rng.choice(defs)
+    first_arg = arg_names[0] if arg_names else "x"
     issue = (f"Issue: {target_file} 中的 {fn}() 在空输入时抛出 TypeError。\n"
              f"请给出最小修复 patch。")
+    # patch 必须引用真实参数名（评审 7.3：禁未定义 args / 省略号）
+    old_line = f"-    return sum(a for a in [{first_arg}] if isinstance(a, (int, float)))"
+    new_line = (f"+    if {first_arg} is None:\n"
+                f"+        return 0\n"
+                f"+    return sum(a for a in ({first_arg},) if isinstance(a, (int, float)))")
     answer = (f"Patch ({target_file}):\n"
               f"@@ def {fn} @@\n"
-              f"-    return sum(a for a in [a0] ...)\n"
-              f"+    if not args: return 0\n"
-              f"+    return sum(a for a in args if isinstance(a, (int, float)))")
+              f"{old_line}\n"
+              f"{new_line}")
+    assert "args" not in answer or first_arg == "args"
+    assert "..." not in answer
     file_pos = ctx.find(f"# file: {target_file}")
     gold_ratio = max(file_pos, 0) / max(len(ctx), 1)
     n_blocks = max(1, round(ctx_tokens / block_size))

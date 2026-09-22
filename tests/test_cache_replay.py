@@ -83,8 +83,10 @@ def test_memory_version_and_trajectory():
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4,
-        oracle_retrieve=[1, 0])   # 第 0 轮后 refresh
-    assert ctrl.memory.memory_version >= 2, "refresh 应递增版本"
+        oracle_retrieve=[2, 0])   # schema v2：第 0 轮后 GLOBAL_REFRESH
+    # T3.3/V2 §9.3：版本随「槽位内容」变更递增；同 source 去重只 bump usage
+    assert ctrl.memory.memory_version >= 1, "至少经过初始检索"
+    assert len(set(ctrl.memory.source_ids[0].tolist())) == ctrl.memory.size, "source_ids 唯一"
     events = [t["event"] for t in ctrl.trajectory]
     assert "initial_retrieval" in events and "refresh" in events
     vers = [t["memory_version"] for t in ctrl.trajectory]

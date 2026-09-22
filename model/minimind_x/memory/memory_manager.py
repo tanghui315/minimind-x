@@ -45,10 +45,15 @@ class MemoryManager(nn.Module):
             return query_vec.new_zeros(query_vec.shape[0], 0)
         rel = _cosine(query_vec.unsqueeze(1), mem.keys).squeeze(1)  # [B, M]
         sim = self.pairwise_sim(mem.keys)
-        off_diag = sim.clone()
-        off_diag.diagonal(dim1=1, dim2=2).fill_(float("-inf"))
-        redundancy = off_diag.max(dim=-1).values                    # D: 与最相似邻居的重复度
-        novelty = 1.0 - redundancy.clamp(min=0)                     # N: 邻居越不像越新颖
+        if mem.size == 1:
+            # 评审 6.1：单块无邻居——redundancy=0, novelty=1（禁止 max(-inf)→Inf/NaN）
+            redundancy = query_vec.new_zeros(query_vec.shape[0], 1)
+            novelty = query_vec.new_ones(query_vec.shape[0], 1)
+        else:
+            off_diag = sim.clone()
+            off_diag.diagonal(dim1=1, dim2=2).fill_(float("-inf"))
+            redundancy = off_diag.max(dim=-1).values.clamp(min=0, max=1)  # D
+            novelty = 1.0 - redundancy                                    # N
         u = (self.alpha * rel + self.beta * mem.usage + self.gamma * novelty
              - self.delta * redundancy + self.eta * mem.persistence)
         return u
@@ -60,18 +65,36 @@ class MemoryManager(nn.Module):
         return 1.0 - _cosine(new_keys, mem_keys).max(dim=-1).values.clamp(min=0)
 
     def update(self, mem: WorkingMemory, new_hidden, new_keys, query_vec, budget_blocks,
-               hit_new=None):
+               hit_new=None, source_ids=None):
         """ADD + SCORE + EVICT：并入新块、按 U 保留 top-budget（Doc 2 §9）。
 
         new_hidden/new_keys: [B, k, d]；budget_blocks: 容量（block 数）；
-        hit_new: [B, k] 新块是否本轮被选中使用（usage 更新）。
+        hit_new: [B, k] 新块是否本轮被选中使用（usage 更新）；
+        source_ids: [B, k] 块来源 id（store 块号）——去重身份（T3.3）。
         返回 (新 WorkingMemory, 被保留的新块 mask, U 全量分数)。
         """
-        mem = mem.with_added(new_hidden, new_keys)
-        if hit_new is not None:  # usage EMA：新块初始 usage 由命中情况决定
-            bsz, m_old = mem.usage.shape[0], mem.size - new_keys.shape[1]
-            hit_full = torch.cat(
-                [mem.usage.new_zeros(bsz, m_old), hit_new.float()], dim=1)
+        # 评审 6.2：按 source_id 合并后，命中必须记到对应块，不能按去重前的槽位拼接
+        prev_ids = mem.source_ids.clone() if not mem.is_empty() else None
+        mem = mem.with_added(new_hidden, new_keys, source_ids=source_ids)
+        if hit_new is not None:
+            bsz, M = mem.usage.shape[0], mem.size
+            hit_full = mem.usage.new_zeros(bsz, M)
+            src = mem.source_ids  # [B, M] 合并后
+            # hit_new 对应「本次尝试并入的 new_keys 行」；按 source_id 映射到合并后槽位
+            if source_ids is not None:
+                for b in range(bsz):
+                    for j in range(source_ids.shape[1]):
+                        sid = int(source_ids[b, j].item())
+                        hit = float(hit_new[b, j].item()) if hit_new.dim() > 1 else float(hit_new[j].item())
+                        # 找到合并后该 source 的槽位
+                        matches = (src[b] == sid).nonzero(as_tuple=True)[0]
+                        if matches.numel():
+                            hit_full[b, matches[0]] = max(hit_full[b, matches[0]].item(), hit)
+            else:
+                # 无 source_id：按末尾新增槽位（旧行为，仅当 with_added 未去重）
+                n_new = new_keys.shape[1]
+                if M >= n_new:
+                    hit_full[:, M - n_new:] = hit_new.float().view(bsz, -1)[:, :n_new]
             mem = mem.with_usage_bumped(hit_full)
         u = self.score(query_vec, mem)
         if not mem.is_empty():

@@ -1,17 +1,16 @@
-"""双执行器（任务清单 T4.6；V2 §10.4）。
+"""双执行器（任务清单 T4.6；V2 §10.4/§11.5）。
 
-1. reference_forward_by_prefix：逐前缀参考执行器——每个位置 t 用可见前缀 x[0..t]
-   与「截止 t 的 memory 时间线」独立前向，是正确性标准。
-2. segmented_forward：按 memory-version/动作边界分段的批处理执行器——段内 Memory
-   在段开始前已确定；利用因果性，段内位置可共用一次批处理前向。
+语义金标准是 **append-only**（与 generate 一致）：
+  - token 只追加写入 cache；已算过的 KV 不回溯
+  - memory 从 W1→W2 只影响此后新 token，不重算历史
+  - 首段可整段 prefill；之后逐 token（或段内）追加
 
-共同语义（两执行器必须逐位对应）：
-  per_token_ce[t] = CE( ŷ_{t+1} | x_{0..t}, M(t) )，t < T-1；per_token_ce[T-1] = 0
-  M(t) = 该 token 所在 segment 生效的 memory（在 segment 开始前已定）
+三个入口：
+  1. reference_append_only —— 带 cache 增量参考（正确性金标准，对齐 generate）
+  2. segmented_forward     —— 按 memory-version/动作边界分段；段间续 cache
+  3. reference_recompute   —— 旧「每前缀从头重算」（仅作对照，不是金标准）
 
-动作时间线：retrieve_actions[i] 是「进入 segment i 时」执行的动作
-（0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH）；非 REUSE 在段边界用可见前缀查询执行。
-训练用给定动作边界时，检索 query 仍只由当前可见前缀计算（T0.1）。
+共同输出：per_token_ce[t] = CE( ŷ_{t+1} | x_{0..t}, append-only 历史 )，t<T-1。
 """
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -30,7 +29,7 @@ def _mem_kw(ctrl):
 
 def build_action_timeline(retrieve_actions: Sequence[int],
                           token_segments: Sequence[Tuple[int, int]]):
-    """构造动作时间线。retrieve_actions[i]：进入 segment i 时执行的动作 id。"""
+    """动作时间线。retrieve_actions[i]：进入 segment i 时执行的动作 id。"""
     assert len(retrieve_actions) == len(token_segments)
     timeline = []
     ver = 0
@@ -46,87 +45,57 @@ def build_action_timeline(retrieve_actions: Sequence[int],
 
 def _prepare_memories(model, input_ids, context_ids, query_len, timeline,
                       controller_factory, attention_mask=None):
-    """按时间线预演 memory：返回 list[mem_kw]，与 timeline 一一对应（段开始前已定）。"""
-    cfg = model.config
+    """按时间线预演 memory（段开始前已定）。返回 list[mem_kw] 与 timeline 对齐。"""
     T = input_ids.shape[1]
     ctrl = controller_factory()
     ctrl.begin(context_ids)
     causal = input_ids[:, :query_len]
     causal_mask = attention_mask[:, :query_len] if attention_mask is not None else None
     q0 = ctrl.raw.model.prelude_hidden(causal, causal_mask)
-    ctrl.memory = ctrl.retrieve_into_memory(q0)  # 初始全局检索
+    ctrl.memory = ctrl.retrieve_into_memory(q0)
 
     mem_list = []
     for seg in timeline:
         a = int(seg["retrieval_action"])
         t0 = int(seg["token_start"])
-        # 进入本段时执行动作（query 只用可见前缀，T0.1）
         if a != ACTION_REUSE:
             vis_len = max(query_len, min(t0 + 1, T))
-            vis = ctrl.raw.model.prelude_hidden(input_ids[:, :vis_len],
-                                               attention_mask[:, :vis_len]
-                                               if attention_mask is not None else None)
+            vis = ctrl.raw.model.prelude_hidden(
+                input_ids[:, :vis_len],
+                attention_mask[:, :vis_len] if attention_mask is not None else None)
             ctrl.memory = ctrl.execute_retrieval_action(
                 a, vis, budget_idx=ctrl._budget_idx(vis), mem=ctrl.memory)
         mem_list.append(_mem_kw(ctrl))
     return mem_list
 
 
-def _ce_at_positions(logits, labels, positions: Sequence[int]) -> torch.Tensor:
-    """per_token_ce[t] = CE(logits[t] → labels[t+1])。返回 [B, T]（未填位置为 0）。"""
-    B, T, _ = logits.shape
-    out = logits.new_zeros(B, T)
-    for t in positions:
-        if t + 1 >= T:
-            continue
-        out[:, t] = F.cross_entropy(logits[:, t, :], labels[:, t + 1],
-                                    ignore_index=-100, reduction="none")
-    return out
+def _mem_at(timeline, mem_list, t):
+    for seg, mk in zip(timeline, mem_list):
+        if seg["token_start"] <= t < seg["token_end"]:
+            return mk
+    return mem_list[-1] if mem_list else {}
+
+
+def _ce_from_logits_seq(logits_seq, labels, device):
+    """logits_seq[t] = 位置 t 的 next-token 分布（处理完 x[t] 后）。"""
+    B, T = labels.shape
+    ce = torch.zeros(B, T, device=device)
+    for t in range(T - 1):
+        ce[:, t] = F.cross_entropy(logits_seq[t], labels[:, t + 1],
+                                   ignore_index=-100, reduction="none")
+    return ce
 
 
 @torch.no_grad()
-def reference_forward_by_prefix(model, input_ids, labels, context_ids, query_len,
-                                timeline, controller_factory, attention_mask=None,
-                                num_loops=None):
-    """逐前缀参考执行器（正确性标准）。返回 (per_token_ce [B,T], last_logits)。"""
-    cfg = model.config
-    B, T = input_ids.shape
-    loops = 1 if not cfg.use_loop else (num_loops or min(cfg.max_loop, cfg.max_loop))
-    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
-                                 controller_factory, attention_mask)
+def reference_append_only(model, input_ids, labels, context_ids, query_len,
+                          timeline, controller_factory, attention_mask=None,
+                          num_loops=None):
+    """append-only 增量参考执行器（V2 §11.5 金标准，与 generate 同语义）。
 
-    def mem_at(t):
-        for seg, mk in zip(timeline, mem_list):
-            if seg["token_start"] <= t < seg["token_end"]:
-                return mk
-        return mem_list[-1] if mem_list else {}
-
-    per_token_ce = torch.zeros(B, T, device=input_ids.device, dtype=torch.float32)
-    if labels is None:
-        return per_token_ce, None
-    last_logits = None
-    for t in range(T):
-        if t + 1 >= T:
-            break  # 位置 T-1 无 next
-        pref = input_ids[:, :t + 1]
-        pref_mask = attention_mask[:, :t + 1] if attention_mask is not None else None
-        out = model(pref, attention_mask=pref_mask, labels=None, num_loops=loops,
-                    **mem_at(t))
-        last_logits = out.logits
-        per_token_ce[:, t] = F.cross_entropy(
-            out.logits[:, -1, :], labels[:, t + 1],
-            ignore_index=-100, reduction="none")
-    return per_token_ce, last_logits
-
-
-@torch.no_grad()
-def segmented_forward(model, input_ids, labels, context_ids, query_len,
-                      timeline, controller_factory, attention_mask=None,
-                      num_loops=None):
-    """分段批处理执行器（优化路径）。返回 (per_token_ce [B,T], last_logits)。
-
-    段内 Memory 已在段开始前确定；因因果 mask，位置 t∈[s,e) 只看见 x_{0..t}，
-    故可用一次前向（整序列 + 本段 memory）抽出段内 per-token CE，与逐前缀逐位一致。
+    · 首段整段 prefill（与 generate 第一步一致）
+    · 之后按 token 追加进 cache；memory 换版只作用于新 token
+    · 历史 KV 永不重算
+    返回 (per_token_ce [B,T], logits_seq list[B,V])
     """
     cfg = model.config
     B, T = input_ids.shape
@@ -134,31 +103,132 @@ def segmented_forward(model, input_ids, labels, context_ids, query_len,
     mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
                                  controller_factory, attention_mask)
 
-    per_token_ce = torch.zeros(B, T, device=input_ids.device, dtype=torch.float32)
-    last_logits = None
-    if labels is None:
-        return per_token_ce, None
+    # 按段推进：段 [s,e) 共用段开始前已定的 memory
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
     for seg, mk in zip(timeline, mem_list):
         s, e = int(seg["token_start"]), int(seg["token_end"])
         s, e = max(0, s), min(T, e)
         if s >= e:
             continue
-        out = model(input_ids, attention_mask=attention_mask, labels=None,
+        for t in range(s, e):
+            out = model(input_ids[:, t:t + 1], past_key_values=past, use_cache=True,
+                        num_loops=loops, **mk)
+            past = out.past_key_values
+            logits_seq[t] = out.logits[:, -1, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
+
+
+@torch.no_grad()
+def segmented_forward(model, input_ids, labels, context_ids, query_len,
+                      timeline, controller_factory, attention_mask=None,
+                      num_loops=None):
+    """分段执行器：段内可批处理追加，段边界续 cache（append-only，不从头重算）。
+
+    与 reference_append_only 数值对应；比逐 token 更省前向次数。
+    返回 (per_token_ce [B,T], logits_seq)
+    """
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
+                                 controller_factory, attention_mask)
+
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
+    for seg, mk in zip(timeline, mem_list):
+        s, e = int(seg["token_start"]), int(seg["token_end"])
+        s, e = max(0, s), min(T, e)
+        if s >= e:
+            continue
+        # 段内一次前向追加 [s,e)：cache 只增不回溯；memory 为段边界前已定的版本
+        out = model(input_ids[:, s:e], past_key_values=past, use_cache=True,
                     num_loops=loops, **mk)
-        last_logits = out.logits
-        # 段内位置 t ∈ [s, e)：CE(logits[t] → labels[t+1])；t=T-1 无 next 保持 0
-        positions = list(range(s, min(e, T - 1)))
-        if positions:
-            per_token_ce[:, s:min(e, T - 1)] = _ce_at_positions(
-                out.logits, labels, positions)[:, s:min(e, T - 1)]
-    return per_token_ce, last_logits
+        past = out.past_key_values
+        # out.logits: [B, e-s, V]；位置 s+i 处理完 x[s+i] 的 next 分布
+        for i in range(e - s):
+            logits_seq[s + i] = out.logits[:, i, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
 
 
-def assert_executors_correspond(ref_ce, seg_ce, atol=1e-5):
-    """T4.6 验收：两执行器语义对应（数值容差内逐位一致）。"""
+@torch.no_grad()
+def reference_recompute(model, input_ids, labels, context_ids, query_len,
+                        timeline, controller_factory, attention_mask=None,
+                        num_loops=None):
+    """旧实现：每前缀从头重算（违反 append-only）。仅作对照，不是金标准。"""
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
+                                 controller_factory, attention_mask)
+    logits_seq: List[torch.Tensor] = [None] * T
+    for t in range(T):
+        out = model(input_ids[:, :t + 1], num_loops=loops,
+                    **_mem_at(timeline, mem_list, t))
+        logits_seq[t] = out.logits[:, -1, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
+
+
+@torch.no_grad()
+def generate_teacher_forced(model, input_ids, mem_schedule, num_loops=None,
+                            prompt_len=None):
+    """与 generate() 同构的 teacher-forcing：首块 prefill，其后逐 token 追加。
+
+    mem_schedule: 每个 token 位置的 mem_kw（或 callable(t)）。
+    用于和 reference_append_only / 真实 generate 对照。
+    """
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    prompt_len = T if prompt_len is None else min(prompt_len, T)
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
+
+    def mem_at(t):
+        if callable(mem_schedule):
+            return mem_schedule(t)
+        return mem_schedule[t] if mem_schedule else {}
+
+    # 与 generate 第一步一致：整段 prompt prefill
+    out = model(input_ids[:, :prompt_len], past_key_values=past, use_cache=True,
+                num_loops=loops, **(mem_at(0) or {}))
+    past = out.past_key_values
+    for i in range(prompt_len):
+        logits_seq[i] = out.logits[:, i, :]
+    # 其后逐 token（generate decode）
+    for t in range(prompt_len, T):
+        out = model(input_ids[:, t:t + 1], past_key_values=past, use_cache=True,
+                    num_loops=loops, **(mem_at(t) or {}))
+        past = out.past_key_values
+        logits_seq[t] = out.logits[:, -1, :]
+    return logits_seq
+
+
+def assert_executors_correspond(ref_logits, seg_logits, atol=1e-4):
+    """数值对应：logits 列表逐位一致。"""
+    if len(ref_logits) != len(seg_logits):
+        return False, f"len mismatch {len(ref_logits)} vs {len(seg_logits)}"
+    max_diff = 0.0
+    for a, b in zip(ref_logits, seg_logits):
+        if a is None or b is None:
+            return False, "None logits"
+        if a.shape != b.shape:
+            return False, f"shape {a.shape} vs {b.shape}"
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            return False, "non-finite"
+        max_diff = max(max_diff, (a - b).abs().max().item())
+    return max_diff <= atol, f"max |Δlogit|={max_diff}"
+
+
+# 兼容旧测试签名（CE 版）
+def assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-5):
     if ref_ce.shape != seg_ce.shape:
         return False, f"shape mismatch {ref_ce.shape} vs {seg_ce.shape}"
-    if not torch.isfinite(ref_ce).all() or not torch.isfinite(seg_ce).all():
-        return False, "non-finite CE"
     diff = (ref_ce - seg_ce).abs().max().item()
     return diff <= atol, f"max |ΔCE|={diff}"

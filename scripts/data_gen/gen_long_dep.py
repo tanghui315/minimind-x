@@ -23,8 +23,10 @@ def filler(rng, n_chars):
 def gen_sample(rng, target_tokens, depth):
     name = f"X{rng.randint(100, 999)}"
     val = rng.randint(1000, 999999)
+    add = rng.randint(1, 100)  # 真值修正：目标必须是 X+正整数，不得仍是原 X
     definition = f"定义：{name} 的初始值为 {val}，后续所有引用必须使用该值。"
-    use = f"计算：{name} 的值加上 {rng.randint(1, 100)}，结果以「{name} 的最终取值是」开头给出：{name} 的最终取值是 {val}。"
+    use = (f"计算：{name} 的值加上 {add}，结果以「{name} 的最终取值是」开头给出："
+           f"{name} 的最终取值是 {val + add}。")
     parts = filler(rng, int(target_tokens * 1.5))
     pos = max(1, int(len(parts) * depth))
     parts.insert(0, definition)

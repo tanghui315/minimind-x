@@ -1,7 +1,9 @@
 """检索式 SFT 数据集（任务清单 T6.5；Doc 4 §8）。
 
-jsonl schema：{"context": str(长上下文), "question": str, "answer": str,
-               "gold_block": int(可选，块号), "oracle_r": int(可选), "oracle_retrieve": [0/1](可选)}
+jsonl schema：{"context": str, "question": str, "answer": str,
+               "gold_block": int, "gold_span": [start,end) 字符偏移,
+               "split": "train"|"val", "oracle_r": int, "oracle_retrieve": [...],
+               "action_schema_version": 1|2}
 
 主干序列只含 问题+答案（长上下文走 store，D9）；context 分块 tokenize 供建库。
 batch 内变长，默认 collate 成 B=1 的 dict（研究级口径；训练器可用任意 B 自行 pad）。
@@ -17,18 +19,39 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 class RetrievalQADataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_question_len=512, max_answer_len=512,
-                 max_context_tokens=None, block_size=256):
+                 max_context_tokens=None, block_size=256, split=None):
         self.tokenizer = tokenizer
         self.max_question_len = max_question_len
         self.max_answer_len = max_answer_len
         self.max_context_tokens = max_context_tokens
         self.block_size = block_size
+        self.split = split
         self.samples = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    self.samples.append(json.loads(line))
+                if not line:
+                    continue
+                rec = json.loads(line)
+                # 评审 7.2：按 split 过滤，val 不得进训练
+                if split is not None and rec.get("split", "train") != split:
+                    continue
+                self.samples.append(rec)
+
+    def _gold_block_from_span(self, context, gold_span):
+        """评审 7.1：gold_span 字符偏移 → 真实 token 块号（按当前 tokenizer/block_size）。"""
+        if not gold_span or gold_span[0] < 0 or not context:
+            return -1
+        start, end = int(gold_span[0]), int(gold_span[1])
+        # 前缀 tokenize 定位 start 对应 token 下标
+        prefix_ids = self.tokenizer(context[:start], add_special_tokens=False).input_ids
+        span_ids = self.tokenizer(context[start:end], add_special_tokens=False).input_ids
+        if not span_ids:
+            return -1
+        tok_start = len(prefix_ids)
+        tok_end = tok_start + max(1, len(span_ids))
+        mid = (tok_start + tok_end - 1) // 2
+        return int(mid // max(1, self.block_size))
 
     def __len__(self):
         return len(self.samples)
@@ -54,9 +77,13 @@ class RetrievalQADataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.long),
             "question_len": torch.tensor(question_len, dtype=torch.long),
             "context_ids": torch.tensor(ctx_ids, dtype=torch.long),
-            "gold_block": torch.tensor(s.get("gold_block", -1), dtype=torch.long),
+            "gold_block": torch.tensor(
+                self._gold_block_from_span(s.get("context", ""), s.get("gold_span"))
+                if s.get("gold_span") and s.get("gold_span", [-1])[0] >= 0
+                else s.get("gold_block", -1), dtype=torch.long),
             "oracle_r": torch.tensor(s.get("oracle_r", 0), dtype=torch.long),
             "oracle_retrieve": torch.tensor(s.get("oracle_retrieve", []), dtype=torch.long),
+            "action_schema_version": s.get("action_schema_version", 1),
             "answer_text": s["answer"],
         }
 
@@ -65,7 +92,11 @@ def collate_retrieval_qa(batch, pad_id=0):
     """变长 pad collate（input/labels pad；context 取 batch 内最长）。"""
     if len(batch) == 1:
         b = batch[0]
-        return {**{k: v.unsqueeze(0) if torch.is_tensor(v) else [v] for k, v in b.items()}}
+        out = {**{k: v.unsqueeze(0) if torch.is_tensor(v) else [v] for k, v in b.items()}}
+        # sft_c_step 用 batch["action_schema_version"] 取标量/列表
+        if isinstance(out.get("action_schema_version"), list):
+            out["action_schema_version"] = out["action_schema_version"][0]
+        return out
     out = {}
     for key in ("input_ids", "labels"):
         seqs = [b[key] for b in batch]
@@ -79,5 +110,6 @@ def collate_retrieval_qa(batch, pad_id=0):
     for key in ("gold_block", "oracle_r"):
         out[key] = torch.stack([b[key] for b in batch])
     out["oracle_retrieve"] = [b["oracle_retrieve"] for b in batch]
+    out["action_schema_version"] = [b.get("action_schema_version", 1) for b in batch]
     out["answer_text"] = [b["answer_text"] for b in batch]
     return out

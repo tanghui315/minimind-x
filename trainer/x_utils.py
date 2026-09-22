@@ -21,16 +21,40 @@ def x_weight_path(save_dir, name, hidden_size):
 def init_model_x(lm_config, from_weight='pretrain', tokenizer_path='../model',
                  save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindXForCausalLM(lm_config)
     if from_weight != 'none':
         path = x_weight_path(save_dir, from_weight, lm_config.hidden_size)
-        weights = torch.load(path, map_location=device)
+        weights = torch.load(path, map_location=device, weights_only=False)
         meta = weights.pop("__meta__", None)  # T5.2 manifest 不进 state_dict
-        if meta:
+        # 评审 8.1：按 checkpoint config 恢复 residual_v2，禁止 V2 权重静默装进 V1 结构
+        ckpt_cfg = (meta or {}).get("config") or {}
+        ckpt_arch = (meta or {}).get("architecture_version") or ""
+        ckpt_v2 = bool(ckpt_cfg.get("residual_v2")) or ckpt_arch.endswith("residual_v2")
+        if ckpt_v2 and not getattr(lm_config, "residual_v2", False):
+            Logger(f'ckpt is residual_v2 -> force lm_config.residual_v2=True ({path})')
+            lm_config.residual_v2 = True
+        if (not ckpt_v2) and getattr(lm_config, "residual_v2", False) and ckpt_cfg:
+            Logger(f'WARN: loading non-v2 ckpt into residual_v2 model ({path})')
+        v2_keys = [k for k in weights if k.startswith((
+            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
+            "model.thinking_core.memory_reader"))]
+        if v2_keys and not getattr(lm_config, "residual_v2", False):
+            raise RuntimeError(
+                f"checkpoint 含 V2 残差模块权重但 residual_v2=False，拒绝静默丢弃: "
+                f"{v2_keys[:3]}...（评审 8.1）")
+        model = MiniMindXForCausalLM(lm_config)
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+        if (meta or {}).get("architecture_version"):
             Logger(f'ckpt meta: arch={meta.get("architecture_version")} '
                    f'params={meta.get("param_manifest", {}).get("total")}')
-        missing, unexpected = model.load_state_dict(weights, strict=False)
+        # unexpected 中的 V2 模块 = 结构不匹配，必须报错而非打日志继续
+        bad_unexp = [k for k in unexpected if k.startswith((
+            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
+            "model.thinking_core.memory_reader"))]
+        if bad_unexp:
+            raise RuntimeError(f"V2 模块权重被丢弃（结构不匹配）: {bad_unexp[:5]}")
         Logger(f'loaded X weights from {path} (missing={len(missing)}, unexpected={len(unexpected)})')
+    else:
+        model = MiniMindXForCausalLM(lm_config)
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     return model.to(device), tokenizer
@@ -53,6 +77,8 @@ def param_manifest(model) -> dict:
     RESIDUAL_KEYS = ("loop_mhar", "update_gate", "memory_reader",
                      "halt_router", "retrieve_router", "budget_router", "retriever")
     NO_DECAY_HINTS = ("scale_logit", "loop_mhar.query", "type_bias")
+    # Frozen Index：key_proj 名义在 retriever 内，但建库 no_grad——优化器应跳过
+    FROZEN_KEY_HINTS = ("retriever.key_proj",)
     groups = {"backbone_decay": 0, "backbone_no_decay": 0,
               "residual_decay": 0, "residual_no_decay": 0}
     for n, pr in raw.named_parameters():
@@ -62,7 +88,11 @@ def param_manifest(model) -> dict:
         no_decay = pr.ndim <= 1 or any(h in n for h in NO_DECAY_HINTS)
         key = ("residual_" if is_residual else "backbone_") + ("no_decay" if no_decay else "decay")
         groups[key] += pr.numel()
+    frozen = sum(pr.numel() for n, pr in raw.named_parameters()
+                 if any(h in n for h in ("retriever.key_proj",)))
     return {"total": total, "by_module": by_module, "param_groups": groups,
+            "frozen_key_params": frozen,
+            "freeze_key": bool(getattr(raw.config, "freeze_key", True)),
             "architecture_version": raw.config.architecture_version()
             if hasattr(raw.config, "architecture_version") else "minimind_x"}
 
@@ -116,7 +146,7 @@ def save_x_checkpoint(model, args_save_dir, save_weight, hidden_size,
 
 def load_x_checkpoint_meta(path):
     """读回 __meta__（optimizer/RNG/进度等），权重键由 load_state_dict 负责。"""
-    weights = torch.load(path, map_location="cpu")
+    weights = torch.load(path, map_location="cpu", weights_only=False)
     meta = weights.pop("__meta__", None)
     return weights, meta
 
@@ -212,9 +242,15 @@ def build_optimizer(model, lr, weight_decay=0.01, residual_lr_mult=2.0):
     RESIDUAL_KEYS = ("loop_mhar", "update_gate", "memory_reader",
                      "halt_router", "retrieve_router", "budget_router", "retriever")
     NO_DECAY_HINTS = ("scale_logit", "loop_mhar.query", "type_bias")
+    # Frozen Index：key_proj 名义在 retriever 内，但建库 no_grad——优化器应跳过
+    FROZEN_KEY_HINTS = ("retriever.key_proj",)
     groups = {"bd": [], "bnd": [], "rd": [], "rnd": []}
     for n, p in raw.named_parameters():
         if not p.requires_grad:
+            continue
+        # freeze_key=True 时 key_proj 显式冻结（评审：避免「Q/K 联训」误解）
+        if getattr(raw.config, "freeze_key", True) and any(h in n for h in FROZEN_KEY_HINTS):
+            p.requires_grad_(False)
             continue
         is_residual = any(k in n for k in RESIDUAL_KEYS)
         no_decay = p.ndim <= 1 or any(h in n for h in NO_DECAY_HINTS)
@@ -265,7 +301,8 @@ def load_pretrained_x(out_dir, device="cpu"):
                                  if k not in ("model_type", "transformers_version",
                                               "architectures")})
     model = MiniMindXForCausalLM(cfg)
-    weights = torch.load(os.path.join(out_dir, "model_x.pth"), map_location="cpu")
+    weights = torch.load(os.path.join(out_dir, "model_x.pth"), map_location="cpu",
+                         weights_only=False)
     weights.pop("__meta__", None)
     model.load_state_dict(weights, strict=False)
     return model.to(device)

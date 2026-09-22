@@ -162,7 +162,8 @@ class MiniMindXModel(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 num_loops=1, halt=False, collect_exits=False, exit_choice=None,
-                memory_kv_per_layer=None, loop_callback=None, memory_payload=None):
+                memory_kv_per_layer=None, loop_callback=None, memory_payload=None,
+                query_len=None):
         cfg = self.config
         if hasattr(past_key_values, 'layers'):  # 兼容 transformers Cache 误传
             past_key_values = None
@@ -193,7 +194,9 @@ class MiniMindXModel(nn.Module):
         presents += pre_presents
 
         # ---- Budget Router：读 Prelude 输出（问题表示），预测预算档 ----
-        budget_logits = self.budget_router(hidden_states) if self.budget_router is not None else None
+        # 评审 3.2：Router 输入必须与执行一致——只可见前缀，不见 gold 后缀
+        router_h = hidden_states if query_len is None else hidden_states[:, :query_len]
+        budget_logits = self.budget_router(router_h) if self.budget_router is not None else None
 
         # ---- ThinkingCore（循环区）----
         num_loops = max(1, int(num_loops)) if cfg.use_loop else 1
@@ -237,23 +240,34 @@ class MiniMindXModel(nn.Module):
         #   r < n_run → 其真实第 r 轮 KV；r ≥ n_run → 其最后实际轮 KV（仅填新 token 位）
         # （passes[r] 已含 past_in 拼接：读侧 clamp 与写侧填充采用同一 last-valid 规则）
         if use_cache:
+            # 评审 5.1 / V2 §11.3：per-sample last-valid——
+            # 布局 [B,S,H,D]；样本 b 的新 token 在 slot r>last_exec[b] 时复制其最后实际轮；
+            # 历史 token 的深槽保留（只填新 token 位）
+            if exit_idx is not None:
+                last_exec = exit_idx.clamp(min=0, max=max(n_run - 1, 0)).tolist()
+            else:
+                last_exec = [n_run - 1] * bsz
             core_caches = []
             for l in range(T):
                 prior_entry = past[P + l] if past_key_values is not None else None
                 prior_slots = prior_entry if isinstance(prior_entry, list) else None
                 slots = []
                 for r in range(cfg.max_loop):
-                    if r < n_run:
-                        slots.append(passes[r][l])
-                        continue
-                    k_fill = passes[n_run - 1][l][0][:, -seq_len:]
-                    v_fill = passes[n_run - 1][l][1][:, -seq_len:]
+                    k_rows, v_rows = [], []
+                    for b in range(bsz):
+                        src_r = max(0, min(r, int(last_exec[b]), n_run - 1))
+                        kb, vb = passes[src_r][l]  # [B,S,H,D]
+                        k_rows.append(kb[b:b + 1])
+                        v_rows.append(vb[b:b + 1])
+                    k_all = torch.cat(k_rows, dim=0)  # [B,S,H,D] per-sample 选轮
+                    v_all = torch.cat(v_rows, dim=0)
                     if prior_slots is not None and r < len(prior_slots):
+                        # 只把新 token 位（末 seq_len）接到历史后；历史深槽不覆盖
                         pk, pv = prior_slots[r]
-                        slots.append((torch.cat([pk, k_fill], dim=1),
-                                      torch.cat([pv, v_fill], dim=1)))
+                        slots.append((torch.cat([pk, k_all[:, -seq_len:]], dim=1),
+                                      torch.cat([pv, v_all[:, -seq_len:]], dim=1)))
                     else:
-                        slots.append(passes[n_run - 1][l])
+                        slots.append((k_all, v_all))
                 core_caches.append(slots)
         presents += core_caches if use_cache else [None] * T
 
@@ -276,21 +290,26 @@ class MiniMindXModel(nn.Module):
         router_probs = None
         if collect_exits:
             router_probs = {}
+            # 评审 3.2：监督 logits 与执行同输入（可见前缀池化）
+            def _vis(h):
+                return h if query_len is None else h[:, :query_len]
             if self.halt_router is not None:
                 rs_list = core_out.get("residual_stats") or [None] * len(exits)
                 router_probs["halt"] = [
-                    self.halt_router(h, rs) for h, rs in zip(exits, rs_list)]
+                    self.halt_router(_vis(h), rs) for h, rs in zip(exits, rs_list)]
             if self.retrieve_router is not None:
-                router_probs["retrieval"] = [self.retrieve_router(h) for h in exits]
-                # T2.5：三动作 logits（默认全可用；controller 轨迹侧按 warm cache mask）
+                router_probs["retrieval"] = [self.retrieve_router(_vis(h)) for h in exits]
                 router_probs["retrieval_action"] = [
-                    self.retrieve_router.action_logits(h, warm_available=True) for h in exits]
+                    self.retrieve_router.action_logits(_vis(h), warm_available=True)
+                    for h in exits]
         # T2.4：halt_logits（非概率）+ residual_stats + memory_versions
         halt_logits_out = None
         if collect_exits and self.halt_router is not None:
             rs_list = core_out.get("residual_stats") or [None] * len(exits)
             halt_logits_out = [
-                self.halt_router.forward_logits(h, rs) for h, rs in zip(exits, rs_list)]
+                self.halt_router.forward_logits(
+                    h if query_len is None else h[:, :query_len], rs)
+                for h, rs in zip(exits, rs_list)]
         residual_stats = core_out.get("residual_stats")
         return dict(hidden_states=hidden_states, presents=presents, aux_loss=aux_loss,
                     exit_hiddens=exit_hiddens, halt_probs=halt_probs, exit_idx=exit_idx,
@@ -315,14 +334,15 @@ class MiniMindXForCausalLM(nn.Module):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 logits_to_keep=0, labels=None, num_loops=None, halt=False,
                 collect_exits=False, exit_choice=None, memory_kv_per_layer=None,
-                loop_callback=None, memory_payload=None, **kwargs):
+                loop_callback=None, memory_payload=None, query_len=None, **kwargs):
         cfg = self.config
         if num_loops is None:
             num_loops = cfg.max_loop if (collect_exits and cfg.use_loop) else 1
         out = self.model(input_ids, attention_mask, past_key_values, use_cache,
                          num_loops=num_loops, halt=halt, collect_exits=collect_exits,
                          exit_choice=exit_choice, memory_kv_per_layer=memory_kv_per_layer,
-                         loop_callback=loop_callback, memory_payload=memory_payload)
+                         loop_callback=loop_callback, memory_payload=memory_payload,
+                         query_len=query_len)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(out["hidden_states"][:, slice_indices, :])
         exit_logits = None
@@ -448,7 +468,9 @@ class MiniMindXForCausalLM(nn.Module):
             stats["avg_loops"] = stats["loop_sum"] / max(stats["steps"], 1)
             stats["avg_ttft_loops"] = stats["ttft_loop_sum"] / max(stats["ttft_steps"], 1)
             stats["avg_decode_loops"] = stats["decode_loop_sum"] / max(stats["decode_steps"], 1)
-            stats["executed_core_rounds"] = stats["loop_sum"]  # V2 §18.1：executed vs selected
+            # 评审 9.4：selected=样本选中出口；executed=物理执行轮（fixed/自适应上界）
+            stats["selected_core_rounds"] = stats["loop_sum"]
+            stats["executed_core_rounds"] = stats["loop_sum"]  # 无 active-mask 压缩时二者相近
             return {'generated_ids': input_ids, 'stats': stats,
                     'past_kv': past_key_values} if kwargs.get("return_kv") else \
                    {'generated_ids': input_ids, 'stats': stats}

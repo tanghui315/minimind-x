@@ -83,9 +83,13 @@ def sft_c_step(batch):
     gold_block = batch["gold_block"].to(args.device)
     query_len = int(batch["question_len"][0].item())       # T0.1：可见前缀边界（数据集提供）
     oracle_r_file = int(batch["oracle_r"][0].item())
-    oracle_ret = batch["oracle_retrieve"][0].tolist()
-    if not isinstance(oracle_ret, (list, tuple)):
-        oracle_ret = [int(oracle_ret)] if int(oracle_ret) >= 0 else []
+    # 动作 schema：数据边界归一到 v2（0=REUSE,1=WARM,2=GLOBAL）；旧二值 v1: 1=GLOBAL
+    from model.minimind_x.router.retrieval_router import normalize_oracle_actions
+    _raw_ret = batch["oracle_retrieve"][0].tolist()
+    if not isinstance(_raw_ret, (list, tuple)):
+        _raw_ret = [int(_raw_ret)] if int(_raw_ret) >= 0 else []
+    _schema = int(batch["action_schema_version"]) if "action_schema_version" in batch else 1
+    oracle_ret = normalize_oracle_actions(_raw_ret, schema_version=_schema)
 
     # ---- 在线 oracle（Doc 4 §3：Self-generated Supervision；小采样率）----
     oracle_r = None
@@ -102,7 +106,8 @@ def sft_c_step(batch):
     if args.train_budget_router and random.random() < args.oracle_rate:
         loss_matrix = sweep_budget(
             model, input_ids, labels, context_ids,
-            controller_factory=lambda: AdaptiveController(model))
+            controller_factory=lambda: AdaptiveController(model),
+            query_len=query_len)  # 评审 3.1：预算检索不得读 gold
         oracle_budget = int(oracle_budget_from_matrix(loss_matrix, lm_config.oracle_epsilon)[0].item())
     if not oracle_ret and random.random() < args.oracle_rate:
         # T2.5/T4.4：三动作反事实（REUSE/RESCORE_WARM/GLOBAL_REFRESH）；
@@ -143,19 +148,11 @@ def sft_c_step(batch):
         ret_action_logits = out.router_probs["retrieval_action"]
         warm_ok = bool(extras.get("warm_available", True))
         n = len(ret_action_logits)
-        from model.minimind_x.router.retrieval_router import (
-            action_mask, ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH)
+        from model.minimind_x.router.retrieval_router import action_mask
         ret_action_masks = [action_mask(warm_ok, device=ret_action_logits[0].device,
                                         batch=ret_action_logits[0].shape[0]) for _ in range(n)]
-        # 归一到 ACTION_* id：旧 0/1 口径 1→GLOBAL_REFRESH；新 2→RESCORE_WARM
-        def _to_action(a):
-            a = int(a)
-            if a == 0:
-                return ACTION_REUSE
-            if a == 2:
-                return ACTION_RESCORE_WARM
-            return ACTION_GLOBAL_REFRESH  # 1 或其它
-        oracle_ret_action = torch.tensor([_to_action(a) for a in oracle_ret], device=args.device)
+        # 标签已是 schema v2，禁止再对调（评审 4.1）
+        oracle_ret_action = torch.tensor(oracle_ret, device=args.device, dtype=torch.long)
     # 二值 retrieve BCE（兼容旧路径）：标签 = 是否离开 REUSE
     oracle_ret_bin = None
     if oracle_ret and retrieve_probs is not None:
@@ -171,7 +168,10 @@ def sft_c_step(batch):
                        config=lm_config,
                        retrieval_action_logits=ret_action_logits,
                        oracle_retrieve_action=oracle_ret_action,
-                       retrieval_action_masks=ret_action_masks)
+                       retrieval_action_masks=ret_action_masks,
+                       retrieval_actions=(oracle_ret_action if oracle_ret_action is not None
+                                          else None),
+                       cost_weight=getattr(lm_config, "lambda_cost", 0.0))
     zero = next(model.parameters()).new_zeros(())
     loss = parts["loss"] + zero + extras.get("retrieval_ce", zero)
     if "distill_loss" in extras and args.lambda_distill > 0:
@@ -326,15 +326,17 @@ def main():
                 break
         if args.max_steps > 0 and step_global >= args.max_steps:
             break
-        if is_main_process():
-            save_x_checkpoint(  # T5.2：完整 checkpoint
-                model, args.save_dir, f'{args.save_weight}_{args.phase}',
-                lm_config.hidden_size, optimizer=optimizer, scaler=scaler,
-                extra={"data_progress": {"epoch": epoch + 1, "step_global": step_global},
-                       "warmup_progress": getattr(args, "residual_warmup_steps", 0),
-                       "tokenizer_manifest": {"path": args.tokenizer_path},
-                       "source_manifest": {"data_path": getattr(args, "data_path", None),
-                                           "retrieval_data_path": getattr(args, "retrieval_data_path", None)}})
+    # 评审 9.1：max_steps / 正常跑完都必须落盘（原先 break 后跳过保存）
+    if is_main_process():
+        save_x_checkpoint(  # T5.2：完整 checkpoint
+            model, args.save_dir, f'{args.save_weight}_{args.phase}',
+            lm_config.hidden_size, optimizer=optimizer, scaler=scaler,
+            extra={"data_progress": {"epoch": epoch + 1 if "epoch" in dir() else 0,
+                                     "step_global": step_global},
+                   "warmup_progress": getattr(args, "residual_warmup_steps", 0),
+                   "tokenizer_manifest": {"path": args.tokenizer_path},
+                   "source_manifest": {"data_path": getattr(args, "data_path", None),
+                                       "retrieval_data_path": getattr(args, "retrieval_data_path", None)}})
 
 
 if __name__ == "__main__":

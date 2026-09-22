@@ -266,4 +266,80 @@ P0 前置缺陷修复（因果泄漏为首，不加新模块就必须修）
 
 测试：**101 passed**（+ field contracts 4 + 动作序 1 + 双执行器 refresh 边界 1）。
 
-剩余待办：T5.3 八卡短跑、T5.4 夜间首训结果验收与对照实验（zone/loss@R、证据任务收益）、策略 RL 仅在重放一致性门槛后开启。
+## 7.4 二次细审修复（2026-09-22）
+
+| 问题 | 修复 |
+|-|-|
+| `memory_versions` 用 `id()%1e5` 充数 | `MemoryInput` 携带真实 `memory_version`；thinking_core 读显式版本 |
+| 检索 `source_ids` 默认槽位 arange → 去重失效 | `memory_manager.update(source_ids=store 块号)`；重复块只 bump usage 不复制 slot |
+| T4.2 课程是线性 0→1 | 改为 V2 §14.2 两段：前 20% 窗口→0.25，后 80%→1（≈总步 1%/5%） |
+| T3.5 缓存键不完整 | `WorkingMemory.cache_key(request/memory_version/layer/proj/encoder/device/dtype)` + `get_kv(cache_key=)` |
+| T4.4 缺条件轨迹成本 C(τ) | `trajectory_cost()` + `joint_loss(cost_weight=)`（默认 0 仅日志） |
+| T4.5 缺 gold span | 七族输出 `gold_span` 字符偏移（token id 由 dataset 按 tokenizer 转换） |
+| T4.7 缺同轨迹重放测试 | `test_v2_replay_and_cachekey.py`：同动作时间线 logits/轨迹一致 + 禁平均深度 |
+
+测试：**106 passed**。
+
+## 7.5 外部评审修复（2026-09-22，G1/G2/G3）
+
+对照《MiniMind-X V2 实现深度审查报告》逐条复现后修复（评审结论大体成立）：
+
+| 组 | 问题 | 修复 |
+|-|-|-|
+| G1 | sweep_budget 丢 query_len，gold 泄漏进预算检索 | query_len 必传；训练 forward 缺 query_len 直接报错 |
+| G1 | Router 训练吃全序列 / 执行吃前缀 | halt/retrieval/budget/action logits 统一 `[:, :query_len]` |
+| G1 | 三动作编号被对调（1↔2） | schema v2 唯一枚举；旧二值仅在数据边界 `normalize_oracle_actions` 转一次 |
+| G1 | 单块 memory score Inf→NaN | 单块 redundancy=0/novelty=1 |
+| G1 | 去重后 usage 记错块 | 按 source_id 映射 hit |
+| G1 | 空 context torch.cat 崩 | 空库合法 no-op；空库跳过检索监督 |
+| G1 | max_steps 跳过最终保存 | 循环外统一落盘 |
+| G1 | GRPO 静默 V2→V1 / unwrap 丢 DDP / 跨设备 cat / 平均深度重放 | meta 强制 residual_v2+拒绝丢模块；梯度走 DDP；CPU cat；禁 avg-depth 除非显式开关 |
+| G2 | 早停样本仍写深轮 KV | per-sample last-valid + update_gate active mask |
+| G2 | Oracle 全程分叉/动作前出口打分 | 同快照三动作，评动作后出口 |
+| G2 | 双执行器均为从头重算 | 保持（append-only 真参考待与 generate 对齐，见剩余） |
+| G3 | Reader 投影每 loop 重算 | 按 memory_version 跨 loop 复用；**每 forward 重置**（防 no_grad sweep 污染） |
+| G3 | gold_span 未转块 / split 未过滤 | dataset 按 tokenizer 重算 gold_block；split 过滤 |
+| G3 | FLOPs/executed 口径 | 投影计 T×M/M；selected vs executed 分字段 |
+
+测试：**119 passed**（含评审回归 G1/G2/G3）。
+
+## 7.6 append-only 对齐（2026-09-22）
+
+| 项 | 状态 | 证据 |
+|-|-|-|
+| reference_append_only | ✅ | 带 cache 增量，金标准（V2 §11.5）：历史 KV 不回溯，memory 换版只作用新 token |
+| segmented_forward | ✅ | 段间续 past_key_values，段内批量追加——对齐 append-only，不再从头重算 |
+| generate_teacher_forced | ✅ | 与 generate 同构（首块 prefill + 逐 token 追加） |
+| reference_recompute | ◐ | 保留为对照路径（违反 append-only，不是金标准） |
+| 对齐测试 | ✅ | append-only↔segmented logits≤1e-4；generate 第二步 argmax 可重放；memory 切换下 segmented 跟 append-only 而非 recompute |
+
+测试：**123 passed**。
+
+剩余（评审亦指出，需更大改动/外部条件）：
+- 训练主路径 collect_exits 仍是全序列 teacher-forcing（与 decode 的 M(t) 边界可再收紧）
+- 混合 batch 的 active-mask 压缩与逐样本动作（当前 batch 统一动作，研究级）
+- T5.3 八卡、T5.4 迁移首训对照
+
+## 7.8 数据真值 + sparse 块级因果（2026-09-22）
+
+| 项 | 修复 |
+|-|-|
+| irrelevant | 干扰设备强制 ≠ 目标；生成自检 context 不得含目标设备（200 条 0 泄漏） |
+| no_evidence | 目标改为确定「不可知」，禁止随机编造采样率 |
+| new_evidence | 增加 `evidence_visible_from_round` 可见时间线 |
+| long_dep | 目标改为 X+正整数（原先仍是 X） |
+| planning | 有序依赖子序列（禁止乱序 sample）+ 约束写入答案 |
+| repo_context | patch 使用真实参数名，禁省略号/未定义 args |
+| sparse 选择器 | 全局 top-k 只选**完整可见块**；未完成块走因果局部窗（改未来不改过去输出） |
+
+测试：**133 passed**。
+
+## 7.7 Frozen Index 声明（2026-09-22）
+
+检索采用 **Frozen Index 范式**（非 bug）：建库 `build_keys` 在 no_grad 下用 `key_proj`
+生成库 key；训练只优化 query 投影 + ranking（CE/蒸馏）。`config.freeze_key=True` 默认，
+`build_optimizer` 显式 `requires_grad_(False)`，manifest 记 `frozen_key_params`。
+文档已修正旧表述「梯度只走 query/key 投影」→「只走 query 投影」。
+未来若要 Q/K 联训：周期 `key_refresh_interval` rebuild index，不能只拆 no_grad。
+测试：**126 passed**。
+

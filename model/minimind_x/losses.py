@@ -52,6 +52,32 @@ def expected_loops(halt_probs: torch.Tensor, force_stop_last=True):
     return (r * p_stop).sum(dim=0)
 
 
+def trajectory_cost(halt_probs=None, retrieval_actions=None, memory_tokens=None,
+                    memory_budgets=None, action_costs=None):
+    """T4.4 / V2 §15.7 条件轨迹成本 C(τ)。
+
+    C(τ) ≈ E[R]/R_max + 动作成本（REUSE=0, RESCORE_WARM=c_w, GLOBAL_REFRESH=c_g）
+    + memory 占比。action_costs 默认 (0, 0.25, 1.0)。返回标量（detached，供日志/可选加权）。
+    """
+    c = 0.0
+    n = 0
+    if halt_probs:
+        r = expected_loops(torch.stack(halt_probs))
+        c = c + float(r.mean().item())
+        n += 1
+    if retrieval_actions is not None:
+        ac = action_costs or (0.0, 0.25, 1.0)
+        acts = [int(a) for a in retrieval_actions]
+        c = c + sum(ac[a] if 0 <= a < len(ac) else ac[-1] for a in acts) / max(len(acts), 1)
+        n += 1
+    if memory_tokens is not None and memory_budgets:
+        b_max = max(memory_budgets)
+        mt = float(memory_tokens) if not torch.is_tensor(memory_tokens) else float(memory_tokens.item())
+        c = c + mt / max(b_max, 1)
+        n += 1
+    return torch.tensor(c / max(n, 1))
+
+
 def expected_memory_cost(budget_probs: torch.Tensor, memory_budgets):
     """budget_probs [B,n档] -> E[|W|]/B_max ∈ (0,1]（Doc 2 §22 C_m）。"""
     budgets = torch.as_tensor(memory_budgets, dtype=torch.float32,
@@ -174,7 +200,9 @@ def joint_loss(exit_logits: List[torch.Tensor], labels: torch.Tensor,
                config=None, halt_valid: Optional[torch.Tensor] = None,
                retrieval_action_logits: Optional[List[torch.Tensor]] = None,
                oracle_retrieve_action: Optional[torch.Tensor] = None,
-               retrieval_action_masks: Optional[List[torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+               retrieval_action_masks: Optional[List[torch.Tensor]] = None,
+               retrieval_actions: Optional[torch.Tensor] = None,
+               cost_weight: float = 0.0) -> Dict[str, torch.Tensor]:
     """联合损失总装（T6.4）。config 提供 λ/α 与预算档；只计算提供了监督信号的部分。
 
     返回 dict：{"loss": 总损失, "lm": ..., "halt": ..., "retrieve": ..., "budget": ...,
@@ -215,5 +243,14 @@ def joint_loss(exit_logits: List[torch.Tensor], labels: torch.Tensor,
         b_max = max(config.memory_budgets)
         ms = memory_size.to(exit_logits[0].device).float()
         parts["memory"] = (ms / b_max).mean()
+    # T4.4：条件轨迹成本 C(τ)（默认 cost_weight=0 只记日志；>0 时可选进 total）
+    if halt_probs is not None or retrieval_actions is not None or memory_size is not None:
+        parts["trajectory_cost"] = trajectory_cost(
+            halt_probs=halt_probs,
+            retrieval_actions=retrieval_actions,
+            memory_tokens=memory_size,
+            memory_budgets=getattr(config, "memory_budgets", None) if config else None)
+        if cost_weight > 0:
+            total = total + cost_weight * parts["trajectory_cost"].to(exit_logits[0].device)
     parts["loss"] = total
     return parts

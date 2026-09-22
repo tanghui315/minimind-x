@@ -16,10 +16,22 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 def residual_progress(step, warmup_steps):
-    """0→1 线性 ramp；warmup_steps<=0 视为从头训练（恒 1）。"""
+    """V2 §14.2 迁移课程曲线。
+
+    warmup_steps 约对应总训练步的 5%：
+      · 前 20% 窗口（= 总步 ~1%）：0 → 0.25
+      · 后 80% 窗口（= 总步 ~1–5%）：0.25 → 1.0
+      · 之后：恒 1.0
+    warmup_steps<=0 视为从头训练（恒 1）。
+    """
     if warmup_steps is None or warmup_steps <= 0:
         return 1.0
-    return min(1.0, max(0.0, float(step) / float(warmup_steps)))
+    t = min(1.0, max(0.0, float(step) / float(warmup_steps)))
+    if t <= 0.2:
+        return 0.25 * (t / 0.2)
+    if t < 1.0:
+        return 0.25 + 0.75 * ((t - 0.2) / 0.8)
+    return 1.0
 
 
 def apply_residual_progress(model, frac, base_strength=1.0, base_progress=1.0):

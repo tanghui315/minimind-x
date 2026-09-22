@@ -61,7 +61,7 @@ def test_three_action_trajectory_and_warm_cache():
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4,
-        oracle_retrieve=[2, 0])  # 第 0 轮后 RESCORE_WARM，第 1 轮 REUSE
+        oracle_retrieve=[1, 0])  # schema v2：第 0 轮后 RESCORE_WARM，第 1 轮 REUSE
     assert extras["warm_available"] is True
     events = [t["event"] for t in ctrl.trajectory]
     assert "initial_retrieval" in events
@@ -71,14 +71,14 @@ def test_three_action_trajectory_and_warm_cache():
 
 
 def test_global_refresh_still_works_and_legacy_oracle():
-    """旧 oracle 0/1 口径：1 仍映射 GLOBAL_REFRESH（兼容）。"""
+    """schema v2：2=GLOBAL_REFRESH；旧 v1 二值经 normalize_oracle_actions 转换。"""
     m = _model()
     ids = torch.randint(3, 60, (1, 8))
     labels = torch.full((1, 8), -100, dtype=torch.long)
     ctx = torch.randint(3, 60, (8 * 4,))
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
-        ids, None, labels, ctx, query_len=4, oracle_retrieve=[1, 0])
+        ids, None, labels, ctx, query_len=4, oracle_retrieve=[2, 0])
     events = [t["event"] for t in ctrl.trajectory]
     assert "refresh" in events or "global_refresh" in events
     assert ctrl.stats["global_refresh"] >= 1
@@ -118,8 +118,8 @@ def test_prefill_fixed_cap_ttft_decode_stats():
 def test_dual_executor_correspondence():
     """T4.6：逐前缀参考执行器与分段执行器数值逐位对应。"""
     from trainer.dual_executor import (
-        build_action_timeline, reference_forward_by_prefix,
-        segmented_forward, assert_executors_correspond)
+        build_action_timeline, reference_append_only,
+        segmented_forward, assert_executors_correspond_ce)
     torch.manual_seed(9)
     m = _model(max_loop=1, residual_v2=True)
     ids = torch.randint(3, 60, (1, 6))
@@ -130,18 +130,18 @@ def test_dual_executor_correspondence():
     def factory():
         return AdaptiveController(m)
 
-    ref_ce, _ = reference_forward_by_prefix(
+    ref_ce, _ = reference_append_only(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     seg_ce, _ = segmented_forward(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
-    ok, msg = assert_executors_correspond(ref_ce, seg_ce, atol=1e-4)
+    ok, msg = assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-4)
     assert ok, f"双执行器应数值对应: {msg}\nref={ref_ce}\nseg={seg_ce}"
     # 因果一致性：换未来 token 不影响早期 CE
     ids2 = ids.clone()
     ids2[0, -1] = (ids2[0, -1] + 1) % 60
-    ref_ce2, _ = reference_forward_by_prefix(
+    ref_ce2, _ = reference_append_only(
         m, ids2, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     assert torch.allclose(ref_ce[:, :3], ref_ce2[:, :3], atol=1e-5), \
@@ -151,8 +151,8 @@ def test_dual_executor_correspondence():
 def test_dual_executor_with_refresh_boundary():
     """T4.6：带动作边界（GLOBAL_REFRESH）时两执行器仍对应。"""
     from trainer.dual_executor import (
-        build_action_timeline, reference_forward_by_prefix,
-        segmented_forward, assert_executors_correspond)
+        build_action_timeline, reference_append_only,
+        segmented_forward, assert_executors_correspond_ce)
     torch.manual_seed(11)
     m = _model(max_loop=1, residual_v2=True)
     ids = torch.randint(3, 60, (1, 6))
@@ -164,13 +164,13 @@ def test_dual_executor_with_refresh_boundary():
     def factory():
         return AdaptiveController(m)
 
-    ref_ce, _ = reference_forward_by_prefix(
+    ref_ce, _ = reference_append_only(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     seg_ce, _ = segmented_forward(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
-    ok, msg = assert_executors_correspond(ref_ce, seg_ce, atol=1e-4)
+    ok, msg = assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-4)
     assert ok, f"动作边界下双执行器应对应: {msg}\nref={ref_ce}\nseg={seg_ce}"
 
 
@@ -236,7 +236,7 @@ def test_action_order_no_retrieve_after_halt():
     # oracle：第 0 轮后 REFRESH，但若 halt 先停则不得检索
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4, oracle_r=torch.tensor([1]),
-        oracle_retrieve=[1, 1, 1])
+        oracle_retrieve=[2, 2, 2])  # 三个 GLOBAL_REFRESH
     events = [t["event"] for t in ctrl.trajectory]
     # R*=1：应在第 0 轮后停，之后无 refresh（不出现「先检索后发现已停」）
     # 训练全展开仍会算辅助轮动作，但 execute 后的 refresh 只发生在未强制停前

@@ -88,15 +88,19 @@ class ReaderFirstBlock(ThinkingBlock):
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None,
                 use_cache=False, attention_mask=None, memory_kv=None,
-                reader=None, memory_payload=None):
+                reader=None, memory_payload=None, memory_kv_proj=None):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask)
         hidden_states = hidden_states + residual
-        if reader is not None and memory_payload is not None:
-            payload, valid = memory_payload
-            hidden_states, _ = reader(hidden_states, reader.project_memory(payload, valid))
+        if reader is not None and (memory_payload is not None or memory_kv_proj is not None):
+            # 评审 9.2：优先用预投影 MemoryKV（跨 loop 复用）；否则现场 project
+            kv = memory_kv_proj
+            if kv is None:
+                payload, valid = memory_payload
+                kv = reader.project_memory(payload, valid)
+            hidden_states, _ = reader(hidden_states, kv)
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
@@ -178,6 +182,15 @@ class ThinkingCore(nn.Module):
         if self.loop_embed is not None:
             hidden_states = hidden_states + self.loop_embed.weight[loop_idx]
         memory_kv_per_layer = memory_kv_per_layer or [None] * self.num_layers
+        # 评审 9.2：同一 memory_version 的 Reader 投影跨 loop 复用
+        mem_kv_proj = None
+        if self.residual_v2 and memory_payload is not None and self.memory_reader is not None:
+            mv = getattr(memory_payload, "memory_version", None)
+            if getattr(self, "_reader_kv_ver", None) != mv or getattr(self, "_reader_kv", None) is None:
+                payload, valid = memory_payload
+                self._reader_kv = self.memory_reader.project_memory(payload, valid)
+                self._reader_kv_ver = mv
+            mem_kv_proj = self._reader_kv
         presents = []
         for l, layer in enumerate(self.layers):
             pl = past_key_values[l]
@@ -189,7 +202,8 @@ class ThinkingCore(nn.Module):
                     hidden_states, present = torch.utils.checkpoint.checkpoint(
                         layer, hidden_states, position_embeddings, past_in, use_cache,
                         attention_mask, memory_kv=mem, reader=self.memory_reader,
-                        memory_payload=memory_payload, use_reentrant=False)
+                        memory_payload=memory_payload, memory_kv_proj=mem_kv_proj,
+                        use_reentrant=False)
                 elif isinstance(layer, ThinkingBlock):
                     hidden_states, present = torch.utils.checkpoint.checkpoint(
                         layer, hidden_states, position_embeddings, past_in, use_cache,
@@ -206,7 +220,7 @@ class ThinkingCore(nn.Module):
                     past_key_value=past_in, use_cache=use_cache,
                     attention_mask=attention_mask, memory_kv=mem,
                     reader=self.memory_reader if self.residual_v2 else None,
-                    memory_payload=memory_payload)
+                    memory_payload=memory_payload, memory_kv_proj=mem_kv_proj)
             elif isinstance(layer, ThinkingBlock):
                 hidden_states, present = layer(
                     hidden_states, position_embeddings,
@@ -235,6 +249,9 @@ class ThinkingCore(nn.Module):
         返回 dict 新增：committed_states（每轮提交状态；v1 路径下与 exit_hiddens 同物）
         """
         num_loops = max(1, int(num_loops))
+        # 评审：Reader 投影缓存不得跨 forward 复用（sweep 等 no_grad 前向会污染 detached 缓存）
+        self._reader_kv = None
+        self._reader_kv_ver = None
         past_key_values = past_key_values or [None] * self.num_layers
         exit_hiddens, presents_per_pass = [], []
         halt_probs, exit_idx = [], None
@@ -267,7 +284,12 @@ class ThinkingCore(nn.Module):
                 memory_payload=memory_payload)
             residual_stats_r = None
             if self.residual_v2:
-                gated, gate = self.update_gate(previous, anchor, candidate)
+                # 评审 5.1：已早停样本 active=False，committed 保持 previous（不写新状态）
+                # active 须为 [B,T]；halted 是 [B]，广播到 token 轴
+                active = None
+                if halt_fn is not None:
+                    active = (~halted).unsqueeze(1).expand(-1, previous.shape[1])
+                gated, gate = self.update_gate(previous, anchor, candidate, active=active)
                 lam = self.config.update_progress
                 committed = candidate + lam * (gated - candidate)
                 # T2.1 / V2 §7.5：halt 用 detached 门控统计（不把 gate 路径绑进 halt 梯度）
@@ -289,10 +311,7 @@ class ThinkingCore(nn.Module):
             residual_stats_per_round.append(residual_stats_r)
             # T2.4：记录本轮 memory 版本（payload 对象身份 → 单调版本号）
             mv = getattr(memory_payload, "memory_version", None)
-            if mv is None and isinstance(memory_payload, tuple) and len(memory_payload) >= 3:
-                mv = memory_payload[2]
-            memory_versions.append(int(mv) if mv is not None else
-                                  (0 if memory_payload is None else id(memory_payload) % 100000))
+            memory_versions.append(int(mv) if mv is not None else 0)
             if halt_fn is not None:
                 # T2.1：halt 读 committed + detached 统计（V2 §7.5 / §12.4）
                 if residual_stats_r is not None:

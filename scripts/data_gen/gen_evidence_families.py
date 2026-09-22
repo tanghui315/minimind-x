@@ -12,7 +12,9 @@
 机制验收（V2 §16.2 随机事实任务）：evidence_needed/new_evidence 每条随机换外部事实，
 train/val 用不同随机种子（事实组合不重叠）；交换/移除 memory 后答案应随之变化。
 
-输出 jsonl：{context, question, answer, family, gold_block, split}
+输出 jsonl：{context, question, answer, family, gold_block, gold_span, split}
+gold_span: 证据句在 context 中的 [start, end) 字符偏移；token id 标注由 dataset 按
+当前 tokenizer/block_size 转换（参数变更须重新生成，V2 §16.2）。
 """
 import os
 import json
@@ -33,7 +35,7 @@ def filler(rng, n_chars):
 
 
 def _block_ctx(rng, facts, n_blocks=6, gold_ratio=0.5):
-    """事实句散布进填充文本；返回 (context, gold_block)。"""
+    """事实句散布进填充文本；返回 (context, gold_block, gold_span)。"""
     parts = [filler(rng, 120) for _ in range(n_blocks)]
     n_blocks_real = len(parts)
     gold_idx = max(0, min(n_blocks_real - 1, int(gold_ratio * n_blocks_real)))
@@ -41,7 +43,11 @@ def _block_ctx(rng, facts, n_blocks=6, gold_ratio=0.5):
     for i, f in enumerate(facts[1:], start=1):
         pos = (gold_idx + 2 * i) % n_blocks_real
         parts[pos] = f
-    return "".join(parts), gold_idx
+    ctx = "".join(parts)
+    # gold_span：facts[0] 在 context 中的 [start, end)（T4.5；token id 由 dataset 转换）
+    start = ctx.find(facts[0])
+    span = [start, start + len(facts[0])] if start >= 0 else [-1, -1]
+    return ctx, gold_idx, span
 
 
 def gen_sample(rng, family):
@@ -49,44 +55,59 @@ def gen_sample(rng, family):
     ver, ver_wrong = rng.sample(VERSIONS, 2)
     val = rng.randint(1000, 9999)
     if family == "no_evidence":
+        # 真值修正：输入无任何依据时目标必须是「不可知」，禁止随机编造采样率
         return {"context": "", "question": f"{dev} 的默认采样率是多少？",
-                "answer": f"{dev} 的默认采样率为 {rng.choice(['10Hz', '20Hz', '50Hz'])}。"}
+                "answer": "上下文未提供默认采样率信息。",
+                "gold_span": [-1, -1], "gold_block": -1, "unanswerable": True}
     if family == "evidence_needed":
         facts = [f"配置记录：{dev} 本次部署的阈值设定为 {val}。"]
-        ctx, gold = _block_ctx(rng, facts)
+        ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"本次部署中 {dev} 的阈值是多少？",
-                "answer": str(val), "gold_block": gold}
+                "answer": str(val), "gold_block": gold, "gold_span": span}
     if family == "irrelevant":
-        facts = [f"配置记录：{rng.choice(DEVICES)} 的阈值设定为 {val}。"]  # 其它设备
-        ctx, gold = _block_ctx(rng, facts)
+        # 真值修正：干扰设备必须 ≠ 目标设备，且 context 不得出现目标设备名
+        others = [d for d in DEVICES if d != dev]
+        other = rng.choice(others)
+        facts = [f"配置记录：{other} 的阈值设定为 {val}。"]
+        ctx, gold, span = _block_ctx(rng, facts)
+        assert dev not in ctx, f"irrelevant 泄漏目标设备: {dev} in ctx"
+        assert str(val) in ctx  # 数值只属于 other，答案仍不可知
         return {"context": ctx, "question": f"{dev} 的阈值是多少？",
-                "answer": "上下文未提供该设备的阈值信息。", "gold_block": -1}
+                "answer": "上下文未提供该设备的阈值信息。", "gold_block": -1, "gold_span": [-1, -1],
+                "unanswerable": True}
     if family == "similar_wrong_ver":
         facts = [f"版本说明：{dev} {ver_wrong} 的阈值为 {val}。"]
-        ctx, gold = _block_ctx(rng, facts)
+        ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"{dev} {ver} 的阈值是多少？",
                 "answer": f"上下文只包含 {ver_wrong} 的信息，缺少 {ver} 的阈值。",
-                "gold_block": -1}
+                "gold_block": -1, "gold_span": [-1, -1], "unanswerable": True}
     if family == "new_evidence":
-        # 关键约束放在文本后段（后续轮检索更可能命中的位置）
+        # 真值修正：证据可见时间线——生效约束在 late_block，首轮检索默认不可见
         facts = [f"补充约束（生效中）：{dev} 的实际阈值为 {val}，覆盖早期文档值。",
                  f"早期文档：{dev} 的阈值为 {rng.randint(100, 999)}（已废弃）。"]
         parts = [filler(rng, 150) for _ in range(6)]
         parts[2], parts[4] = facts[1], facts[0]
-        return {"context": "".join(parts), "question": f"{dev} 当前的有效阈值是多少？",
-                "answer": str(val), "gold_block": 4}
+        ctx = "".join(parts)
+        start = ctx.find(facts[0])
+        span = [start, start + len(facts[0])] if start >= 0 else [-1, -1]
+        return {"context": ctx, "question": f"{dev} 当前的有效阈值是多少？",
+                "answer": str(val), "gold_block": 4, "gold_span": span,
+                # 可见时间线：生效证据块在第 1 轮后才允许进 Hot Memory
+                "evidence_visible_from_round": 1,
+                "stale_block": 2, "gold_block_late": 4}
     if family == "multi_hop":
         dev2 = rng.choice([d for d in DEVICES if d != dev])
         facts = [f"链路表：{dev} 的上行通道绑定到 {dev2}。",
                  f"配置记录：{dev2} 的阈值设定为 {val}。"]
-        ctx, gold = _block_ctx(rng, facts)
+        ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"{dev} 所绑定设备的阈值是多少？",
-                "answer": str(val), "gold_block": gold}
+                "answer": str(val), "gold_block": gold, "gold_span": span}
     if family == "insufficient":
         facts = [f"配置记录：{dev} 的阈值设定为（待填写）。"]
-        ctx, gold = _block_ctx(rng, facts)
+        ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"{dev} 的阈值是多少？",
-                "answer": "记录中该字段为空，无法给出阈值。", "gold_block": gold}
+                "answer": "记录中该字段为空，无法给出阈值。", "gold_block": gold, "gold_span": span,
+                "unanswerable": True}
     raise ValueError(family)
 
 
@@ -110,6 +131,13 @@ def main():
                     rec = gen_sample(rng, fam)
                     rec["family"] = fam
                     rec["split"] = split
+                    # 真值自检（评审 7.3）：irrelevant 不得泄漏目标设备
+                    if fam == "irrelevant":
+                        q = rec.get("question", "")
+                        # question 含目标设备名是合法的；context 不得含
+                        dev_tok = [d for d in DEVICES if d in q]
+                        for d in dev_tok:
+                            assert d not in rec.get("context", ""), f"irrelevant 泄漏 {d}"
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(f"written {2 * len(FAMILIES) * args.n_per_family} samples "
           f"(train/val 事实流隔离) -> {args.out}")

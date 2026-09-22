@@ -91,7 +91,8 @@ def test_sweep_budget_and_retrieval_labels():
     y = torch.randint(3, 64, (1, 10))
     ctx = torch.randint(3, 64, (cfg.block_size * 3,))
     loss_matrix = sweep_budget(model, x, y, ctx,
-                               controller_factory=lambda: AdaptiveController(model))
+                               controller_factory=lambda: AdaptiveController(model),
+                               query_len=6)
     assert loss_matrix.shape == (1, len(cfg.memory_budgets))
     assert torch.isfinite(loss_matrix).all()
     # V2 反事实口径（T0.1）：REUSE vs REFRESH，同可见前缀，不读 gold 后缀

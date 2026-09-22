@@ -13,6 +13,26 @@ memory 内容不变时 loop 间直接复用，内容变更（新对象）后自�
 import torch
 
 
+class MemoryInput(tuple):
+    """(payload, valid) 二元组 + memory_version（T2.4）。
+
+    `payload, valid = mem_in` 兼容旧解包；`mem_in.memory_version` 供轨迹/输出。
+    """
+
+    def __new__(cls, payload, valid, memory_version: int = 0):
+        obj = super().__new__(cls, (payload, valid))
+        obj.memory_version = int(memory_version)
+        return obj
+
+    @property
+    def payload(self):
+        return self[0]
+
+    @property
+    def valid_mask(self):
+        return self[1]
+
+
 class WorkingMemory:
     def __init__(self, hidden, keys, usage=None, persistence=None, block_size=256,
                  source_ids=None, memory_version=0, valid=None, metadata=None):
@@ -134,11 +154,29 @@ class WorkingMemory:
                              valid=self.valid, metadata=self.metadata)
 
     # ---- 跨 loop K/V 缓存 ----
-    def get_kv(self, thinking_core):
-        """返回与 thinking_core.layers 对齐的 [(k, v), ...]；缓存失效自动重投影。"""
+    def get_kv(self, thinking_core, cache_key=None):
+        """返回与 thinking_core.layers 对齐的 [(k, v), ...]；缓存失效自动重投影。
+
+        cache_key（T3.5）：提供时与 self._kv_cache_key 比对，不一致则重投影。
+        """
+        if cache_key is not None and getattr(self, "_kv_cache_key", None) != cache_key:
+            self._kv_cache = None
         if self._kv_cache is None:
             self._kv_cache = thinking_core.project_memory(self.token_hidden())
+            self._kv_cache_key = cache_key
         return self._kv_cache
 
     def invalidate_kv(self):
         self._kv_cache = None
+
+    def cache_key(self, request_id=None, reader_layer_id=0,
+                  projection_weight_version=0, encoder_version=0,
+                  device="cpu", dtype="float32"):
+        """T3.5 / V2 §11.1：Memory KV 缓存键。
+
+        含 request / memory_version / layer / 投影版本 / encoder 版本 / device / dtype
+        —— 仅用 Python 对象身份判断失效不够。
+        """
+        return (str(request_id), int(self.memory_version), int(reader_layer_id),
+                int(projection_weight_version), int(encoder_version),
+                str(device), str(dtype))
