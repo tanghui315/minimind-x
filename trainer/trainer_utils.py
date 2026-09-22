@@ -109,11 +109,8 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     else:  # 加载模式
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
-            saved_ws = ckp_data.get('world_size', 1)
-            current_ws = dist.get_world_size() if dist.is_initialized() else 1
-            if saved_ws != current_ws:
-                ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws
-                Logger(f'GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data["step"]}')
+            # 注意：step 是 per-rank 的 loader 步数，不随 world_size 缩放，
+            # 跨卡数恢复的正确处理（从头跑/续跑守卫）由调用方负责（train_pretrain_x）。
             return ckp_data
         return None
 
