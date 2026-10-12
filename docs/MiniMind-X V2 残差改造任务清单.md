@@ -332,7 +332,25 @@ P0 前置缺陷修复（因果泄漏为首，不加新模块就必须修）
 | repo_context | patch 使用真实参数名，禁省略号/未定义 args |
 | sparse 选择器 | 全局 top-k 只选**完整可见块**；未完成块走因果局部窗（改未来不改过去输出） |
 
-测试：**133 passed**。
+## 7.9 Frozen Index 收口补强（2026-09-22 外审 P0-P3）
+
+| 项 | 状态 |
+|-|-|
+| P0 Index Manifest | ✅ store.metadata：key_encoder_hash/block_size/tokenizer/model_version + assert_compatible |
+| P1 key refresh | ✅ controller.refresh_index / maybe_refresh_index；sft_c 接线；interval=0 仍 Frozen forever |
+| P2 文档口径 | ✅ 「query encoder 路径（Prelude + query_proj）」而非仅 query_proj |
+| P3 消融脚本 | ✅ scripts/exp_key_refresh_ablation.py（A freeze / B refresh）；Recall@1/@8 + manifest |
+| 漂移实验 | ◐ 长训对比 B vs A 待 H200 窗口（下一轮实验重点） |
+
+## 7.10 收口审查修复（2026-09-22）
+
+| 问题 | 修复 |
+|-|-|
+| freeze_key 只在 optimizer 生效（init 时仍可训） | 模型构造即 `key_proj.requires_grad_(False)`，仍保留 state_dict |
+| refresh_index 后 warm_candidates / last_global 未失效 | 索引指纹变更时清空 stale 重排缓存 |
+| 空 context_ids（[0] 或 [1,0]）sft_c 崩 | collate 形状防御，no_evidence 可训 |
+
+测试：**140 passed**。
 
 ## 7.7 Frozen Index 声明（2026-09-22）
 
@@ -343,3 +361,22 @@ P0 前置缺陷修复（因果泄漏为首，不加新模块就必须修）
 未来若要 Q/K 联训：周期 `key_refresh_interval` rebuild index，不能只拆 no_grad。
 测试：**126 passed**。
 
+
+
+## 7.11 V2 迁移首训失败根因与根治（2026-09-30）
+
+9-22 夜 V2 迁移首训 56 秒即败（iteration 2 DDP "Expected to have finished reduction"）。
+
+**根因定位过程**：CPU gloo 2 进程复现 → 排除 grad_ckpt（开关皆挂）→ 排除 T0.2 router 计算
+（collect_routers=False 仍挂）→ 二分变体（middle_loop/minimind_x、v1/v2 全挂）→ 单进程无梯度
+参数清单（reader/routers/retriever 共 23 项，全部「从未进前向」）→ 确认为该 torch 版本 DDP
+reducer 对「未使用且未冻结」参数集合的兼容缺陷（9-19 NCCL 8 卡成功的是更小未用集，
+行为不稳定不可依赖）。
+
+**根治（机制性，非绕过）**：Stage-0 冻结全部不监督模块（halt/retrieval/budget router、
+retriever、memory_reader → requires_grad=False）。DDP 只同步可训练参数、全部参与 loss →
+reducer 歧义消除。与 V2 §13.1「冻结参数 ≠ no_grad 前向」一致；Stage-2/3 监督时重新解冻。
+
+**验证**：2-proc gloo DDP 6 步双 rank 全过（此前 2 步必挂）；140 测试保持全绿。
+附加防御：run_stage0_v2 的 grad_ckpt 置 0（768×8 无需检查点，且规避 ckpt×DDP 叠加面）。
+夜间流水线（2026-09-30 21:00）与恢复定时器（2026-10-01 08:00）均已重新武装。

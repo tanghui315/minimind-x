@@ -122,13 +122,15 @@ def main():
         out.write("- 选择规则：MiniMind-X / V2 实现面（model/minimind_x + 相关 trainer/dataset/"
                   "data_gen/tests），按 模型→训练器→数据→脚本→测试→文档 排序\n")
         out.write("- 审查焦点：V2 残差改造（Loop-MHAR / UpdateGate / GatedMemoryReader）、"
-                  "因果 query、三动作检索、缓存契约、双执行器、训练接线、checkpoint\n")
+                  "因果 query、三动作检索、缓存契约、append-only 双执行器、Frozen Index、"
+                  "训练接线、checkpoint、合成数据真值、sparse 块级因果\n")
         out.write("- 背景材料：docs/MiniMind-X V2 残差改造任务清单.md（任务与验收）、"
                   "docs/minimind_x_gated_recurrence_loop_mhar_memory_reader_v2.md（V2 规格）、"
                   "docs/ARCHITECTURE.md（D1–D9）\n")
-        out.write("- 验证状态：python -m pytest tests/ -q → **106 passed**"
+        out.write("- 验证状态：python -m pytest tests/ -q → **133 passed**"
                   "（本地 CPU + H200 torch 2.11 双环境一致）\n")
-        out.write("- 已知剩余：T5.3 八卡短跑、T5.4 迁移首训对照（待 H200 夜间窗口）\n\n")
+        out.write("- 已知剩余：T5.3 八卡短跑、T5.4 迁移首训对照（待 H200 夜间窗口）；"
+                  "训练主路径 collect_exits 仍是全序列 teacher-forcing\n\n")
         out.write("## 目录\n\n")
         for f, _, content in sections:
             out.write(f"- `{f}` ({content.count(chr(10)) + 1} 行)\n")

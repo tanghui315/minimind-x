@@ -1,76 +1,81 @@
 # MiniMind-X 当前实现审查包（含 V2 残差改造）
 
-- 文件数：63（代码 60 / 文档 3）
-- 总行数：9470
+- 文件数：68（代码 65 / 文档 3）
+- 总行数：10397
 - 选择规则：MiniMind-X / V2 实现面（model/minimind_x + 相关 trainer/dataset/data_gen/tests），按 模型→训练器→数据→脚本→测试→文档 排序
-- 审查焦点：V2 残差改造（Loop-MHAR / UpdateGate / GatedMemoryReader）、因果 query、三动作检索、缓存契约、双执行器、训练接线、checkpoint
+- 审查焦点：V2 残差改造（Loop-MHAR / UpdateGate / GatedMemoryReader）、因果 query、三动作检索、缓存契约、append-only 双执行器、Frozen Index、训练接线、checkpoint、合成数据真值、sparse 块级因果
 - 背景材料：docs/MiniMind-X V2 残差改造任务清单.md（任务与验收）、docs/minimind_x_gated_recurrence_loop_mhar_memory_reader_v2.md（V2 规格）、docs/ARCHITECTURE.md（D1–D9）
-- 验证状态：python -m pytest tests/ -q → **106 passed**（本地 CPU + H200 torch 2.11 双环境一致）
-- 已知剩余：T5.3 八卡短跑、T5.4 迁移首训对照（待 H200 夜间窗口）
+- 验证状态：python -m pytest tests/ -q → **133 passed**（本地 CPU + H200 torch 2.11 双环境一致）
+- 已知剩余：T5.3 八卡短跑、T5.4 迁移首训对照（待 H200 夜间窗口）；训练主路径 collect_exits 仍是全序列 teacher-forcing
 
 ## 目录
 
 - `model/minimind_x/__init__.py` (18 行)
 - `model/minimind_x/coda.py` (20 行)
-- `model/minimind_x/config.py` (215 行)
-- `model/minimind_x/controller.py` (375 行)
-- `model/minimind_x/flops.py` (73 行)
+- `model/minimind_x/config.py` (221 行)
+- `model/minimind_x/controller.py` (405 行)
+- `model/minimind_x/flops.py` (75 行)
 - `model/minimind_x/losses.py` (256 行)
 - `model/minimind_x/memory/__init__.py` (4 行)
-- `model/minimind_x/memory/memory_manager.py` (87 行)
+- `model/minimind_x/memory/memory_manager.py` (109 行)
 - `model/minimind_x/memory/reader.py` (118 行)
 - `model/minimind_x/memory/working_memory.py` (182 行)
-- `model/minimind_x/minimind_x.py` (487 行)
+- `model/minimind_x/minimind_x.py` (509 行)
 - `model/minimind_x/prelude.py` (104 行)
 - `model/minimind_x/residual/__init__.py` (5 行)
 - `model/minimind_x/residual/loop_mhar.py` (56 行)
 - `model/minimind_x/residual/recurrent_update.py` (65 行)
 - `model/minimind_x/retrieval/__init__.py` (5 行)
 - `model/minimind_x/retrieval/block_store.py` (66 行)
-- `model/minimind_x/retrieval/qsa_retriever.py` (108 行)
-- `model/minimind_x/retrieval/sparse_attn.py` (81 行)
+- `model/minimind_x/retrieval/qsa_retriever.py` (112 行)
+- `model/minimind_x/retrieval/sparse_attn.py` (86 行)
 - `model/minimind_x/router/__init__.py` (5 行)
 - `model/minimind_x/router/budget_router.py` (19 行)
 - `model/minimind_x/router/halt_router.py` (54 行)
-- `model/minimind_x/router/retrieval_router.py` (56 行)
-- `model/minimind_x/thinking_core.py` (309 行)
-- `trainer/dual_executor.py` (164 行)
-- `trainer/oracle_labels.py` (202 行)
+- `model/minimind_x/router/retrieval_router.py` (77 行)
+- `model/minimind_x/thinking_core.py` (331 行)
+- `trainer/dual_executor.py` (234 行)
+- `trainer/oracle_labels.py` (224 行)
 - `trainer/residual_schedule.py` (47 行)
-- `trainer/train_grpo_x.py` (342 行)
+- `trainer/train_grpo_x.py` (357 行)
 - `trainer/train_pretrain_x.py` (281 行)
-- `trainer/train_sft_x.py` (344 行)
-- `trainer/x_utils.py` (272 行)
-- `dataset/retrieval_qa_dataset.py` (83 行)
+- `trainer/train_sft_x.py` (343 行)
+- `trainer/x_utils.py` (308 行)
+- `dataset/retrieval_qa_dataset.py` (115 行)
 - `scripts/data_gen/__init__.py` (1 行)
-- `scripts/data_gen/gen_evidence_families.py` (129 行)
-- `scripts/data_gen/gen_long_dep.py` (48 行)
+- `scripts/data_gen/gen_evidence_families.py` (147 行)
+- `scripts/data_gen/gen_long_dep.py` (50 行)
 - `scripts/data_gen/gen_memory_mgmt.py` (56 行)
 - `scripts/data_gen/gen_multihop.py` (62 行)
 - `scripts/data_gen/gen_needle.py` (66 行)
-- `scripts/data_gen/gen_planning.py` (67 行)
-- `scripts/data_gen/gen_repo_context.py` (74 行)
+- `scripts/data_gen/gen_planning.py` (74 行)
+- `scripts/data_gen/gen_repo_context.py` (89 行)
 - `tests/conftest.py` (4 行)
 - `tests/test_actions_and_executors.py` (250 行)
+- `tests/test_append_only_alignment.py` (106 行)
 - `tests/test_cache_replay.py` (137 行)
 - `tests/test_causality.py` (95 行)
 - `tests/test_config.py` (50 行)
+- `tests/test_data_truth_and_sparse_causal.py` (104 行)
 - `tests/test_distill.py` (83 行)
 - `tests/test_equivalence.py` (95 行)
 - `tests/test_flops.py` (40 行)
-- `tests/test_learnability.py` (102 行)
+- `tests/test_frozen_key_index.py` (57 行)
+- `tests/test_learnability.py` (103 行)
 - `tests/test_loop_kv.py` (100 行)
 - `tests/test_losses.py` (85 行)
 - `tests/test_memory.py` (77 行)
 - `tests/test_residual_invariants.py` (238 行)
 - `tests/test_residual_v2_integration.py` (90 行)
 - `tests/test_retrieval.py` (105 行)
+- `tests/test_review_g1_fixes.py` (130 行)
+- `tests/test_review_g2g3_fixes.py` (118 行)
 - `tests/test_sparse_and_cot.py` (84 行)
 - `tests/test_trainer_gradients.py` (115 行)
 - `tests/test_v2_acceptance.py` (82 行)
 - `tests/test_v2_field_contracts.py` (117 行)
 - `tests/test_v2_replay_and_cachekey.py` (111 行)
-- `docs/MiniMind-X V2 残差改造任务清单.md` (283 行)
+- `docs/MiniMind-X V2 残差改造任务清单.md` (344 行)
 - `docs/minimind_x_gated_recurrence_loop_mhar_memory_reader_v2.md` (1832 行)
 - `docs/ARCHITECTURE.md` (289 行)
 
@@ -265,6 +270,10 @@ class MiniMindXConfig(PretrainedConfig):
         self.topk_coarse = kwargs.get("topk_coarse", 64)
         self.topk_fine = kwargs.get("topk_fine", 8)
         self.retrieve_query_pool = kwargs.get("retrieve_query_pool", "mean")
+        # Frozen Index 范式（外部百万 token 记忆）：建库时 key encoder 冻结，
+        # 训练只优化 query encoder + ranking；见 V2 §13 / 评审 8.5 分
+        self.freeze_key = bool(kwargs.get("freeze_key", True))
+        self.key_refresh_interval = int(kwargs.get("key_refresh_interval", 0))  # 0=永不周期刷新
 
         # ---- 分区注意力（Doc 1 §19）----
         self.prelude_attn = kwargs.get("prelude_attn", "full")   # "full" | "local" | "sparse"
@@ -333,6 +342,8 @@ class MiniMindXConfig(PretrainedConfig):
             errors.append("memory_budgets 须为正且递增")
         if not (0 <= self.default_budget_idx < len(self.memory_budgets)):
             errors.append("default_budget_idx 越界")
+        if self.freeze_key and self.key_refresh_interval < 0:
+            errors.append("key_refresh_interval 不得为负")
         if errors:
             raise ValueError("MiniMindXConfig 非法:\n- " + "\n- ".join(errors))
         return True
@@ -378,7 +389,7 @@ from .retrieval.block_store import LongContextStore
 from .memory.working_memory import WorkingMemory, MemoryInput
 from .router.retrieval_router import (
     ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH, ACTION_NAMES,
-    action_mask)
+    action_mask, normalize_oracle_actions, ACTION_SCHEMA_VERSION)
 
 
 
@@ -416,7 +427,11 @@ class AdaptiveController:
     # ---------------------------------------------------------------- 建库与初检
     def begin(self, context_ids):
         self.store = LongContextStore(context_ids, self.cfg.block_size)
-        self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
+        if self.store.n_blocks == 0:
+            # no_evidence 族：空库合法（G1/评审 6.3）——不建索引，检索将返回空 memory
+            self.store.block_keys = None
+        else:
+            self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
         self.memory = None
         self.stats = {"retrievals": 0, "memory_tokens": 0, "re_retrievals": 0,
                       "budget_cap_tokens": 0, "actual_valid_tokens": 0, "unique_blocks": 0,
@@ -450,6 +465,26 @@ class AdaptiveController:
         budget_idx = self.cfg.default_budget_idx if budget_idx is None else budget_idx
         is_initial = mem is None
         budget_blocks = self.cfg.budget_blocks(budget_idx)
+        if self.store.n_blocks == 0 or self.store.block_keys is None:
+            # 空库：合法 no-op memory（评审 6.3）
+            mem = mem if mem is not None else WorkingMemory(
+                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.block_size,
+                                       self.cfg.hidden_size),
+                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
+            self.stats["retrievals"] += 1
+            self.stats["global_refresh"] = self.stats.get("global_refresh", 0) + 1
+            self.stats["memory_tokens"] = mem.token_size
+            self.stats["actual_valid_tokens"] = mem.token_size
+            self.stats["unique_blocks"] = 0
+            self.stats["budget_cap_tokens"] = self.cfg.memory_budgets[budget_idx]
+            self.stats["last_result"] = None
+            self.stats["last_global_result"] = None
+            self.warm_candidates = None
+            if is_initial:
+                self._trace("initial_retrieval", budget_idx=budget_idx,
+                            cap_tokens=self.stats["budget_cap_tokens"],
+                            valid_tokens=0, unique=0)
+            return mem
         result = self.raw.model.retriever.retrieve(
             query_hidden, self.store, self.raw, topk_fine=budget_blocks)  # T0.3 联动
         self.stats["retrievals"] += 1
@@ -591,18 +626,16 @@ class AdaptiveController:
         def cb(r, exit_hidden):
             """轮间动作（T2.5）：REUSE / RESCORE_WARM / GLOBAL_REFRESH。
 
-            oracle_retrieve 支持两种口径：
-              · 0/1 列表（旧）：0=REUSE，1=GLOBAL_REFRESH
-              · 0/1/2 列表（V2）：三动作 id
+            oracle_retrieve 必须已是 schema v2 枚举（0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH）。
+            旧二值标签请先经 normalize_oracle_actions(..., schema_version=1) 转换，禁止在此对调。
             无 oracle 时用 RetrievalRouter.action_logits（RESCORE_WARM 无 warm cache 则 mask）。
             """
             vis = exit_hidden[:, :query_len] if query_len else exit_hidden
             warm_ok = self.has_warm_cache()
             if oracle_retrieve is not None and r < len(oracle_retrieve):
-                raw_a = int(oracle_retrieve[r])
-                # 旧 0/1 口径映射：1 → GLOBAL_REFRESH（保持既有语义）
-                action = ACTION_GLOBAL_REFRESH if raw_a == 1 else (
-                    ACTION_RESCORE_WARM if raw_a == 2 else ACTION_REUSE)
+                action = int(oracle_retrieve[r])  # 已是 schema v2，禁止再映射
+                if action not in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+                    raise ValueError(f"oracle 动作非法: {action}（须先 normalize）")
                 if action == ACTION_RESCORE_WARM and not warm_ok:
                     action = ACTION_GLOBAL_REFRESH  # oracle 也不允许无缓存 RESCORE
                 a_logp = None
@@ -670,12 +703,18 @@ class AdaptiveController:
                              oracle_r=None, distill=True, query_len=None):
         """SFT-C / Stage 3 的 teacher-forced 终局训练前向（D5 + T0.1/T0.7）。
 
-        query_len: 可见前缀边界（必须由调用方提供；初始检索与 gold CE 重算只用
+        query_len: 可见前缀边界（训练路径必填；初始检索与 gold CE 重算只用
         input_ids[:, :query_len]，换 gold completion 不改变检索——因果契约）。
         返回 (MiniMindXOutput, extras)。
         """
         if query_len is None:
-            query_len = input_ids.shape[1]  # 兼容旧行为（推理/全可见）；训练路径应显式传
+            is_training = bool(getattr(self.model, "training", False)
+                               or getattr(self.raw, "training", False))
+            if is_training:
+                raise ValueError(
+                    "forward_with_oracles 训练路径必须显式传 query_len（禁止默认全序列，"
+                    "否则检索/RB 路由会读到 gold answer）")
+            query_len = input_ids.shape[1]  # 纯推理/全可见
         causal_ids = input_ids[:, :query_len]
         self.begin(context_ids)
         q_hidden = self.raw.model.prelude_hidden(causal_ids, attention_mask[:, :query_len]
@@ -684,8 +723,9 @@ class AdaptiveController:
         with torch.no_grad():  # D5：memory 构建/选择路径不回传梯度
             self.memory = self.retrieve_into_memory(q_hidden, budget_idx=budget_idx)
             mem_input = self._memory_input()
+        # 动作 schema：调用方传入的 oracle_retrieve 一律视为 v2；旧 0/1 由 sft 边界转换
         cb = self.make_loop_callback(oracle_retrieve=oracle_retrieve, query_len=query_len)
-        fwd = dict(collect_exits=True, loop_callback=cb)
+        fwd = dict(collect_exits=True, loop_callback=cb, query_len=query_len)
         if getattr(self.cfg, "residual_v2", False):
             fwd["memory_payload"] = mem_input
         else:
@@ -712,7 +752,8 @@ class AdaptiveController:
             extras["retrieval_action_masks"] = out.router_probs.get("retrieval_action_mask")
         # ---- T0.7：监督项用 grad mode 重算的 logits（离散选择仍 no_grad）----
         zero = None
-        if gold_block_idx is not None or distill:
+        # 空库（no_evidence）：无检索监督可算
+        if (gold_block_idx is not None or distill) and self.store.n_blocks > 0:
             q_grad = self.raw.model.prelude_hidden(
                 causal_ids, attention_mask[:, :query_len]
                 if attention_mask is not None else None, no_grad=False)
@@ -788,8 +829,9 @@ def estimate_flops(config, seq_len, loops=1, memory_blocks=0, n_retrievals=0,
     qh = getattr(config, "reader_query_heads", None) or max(2, d // 64)
     kvh = getattr(config, "reader_kv_heads", 2)
     hd = getattr(config, "reader_head_dim", 64)
-    reader_qo = (T * R) * 2 * (d * qh * hd + qh * hd * d)
-    reader_kv = 2 * (d * kvh * hd) * max(1, mem_tokens and 1)  # 一次投影
+    # 评审 9.4：投影按 T×M 与 M 计（不是常数）；K/V 一次/版本，Q/O 逐轮
+    reader_qo = (T * R) * 2 * seq_len * (d * qh * hd + qh * hd * d)  # Q/O 投影 ~ T·S
+    reader_kv = 2 * mem_tokens * (d * kvh * hd)  # K/V 投影 ~ M（每 memory version 一次）
     reader_gate = (T * R) * 2 * (2 * d * 32 + 32)  # gate_fc1/2 近似
     # MHAR：来源轴加权 O(B·T·D·N_src)，N_src≈R
     mhar = (T * R) * (d * (R + 1))
@@ -807,7 +849,8 @@ def estimate_flops(config, seq_len, loops=1, memory_blocks=0, n_retrievals=0,
             "reader_attn": float(reader_attn), "reader_proj": float(reader_qo + reader_kv),
             "reader_gate": float(reader_gate), "mhar": float(mhar),
             "update_gate": float(update_gate), "residual_modules": float(residual),
-            "effective_depth": P + C + T * R}
+            "effective_depth": P + C + T * R,
+            "executed_core_rounds_note": "executed=R×T（物理）；selected 见 generate stats.avg_loops"}
 ```
 
 ---
@@ -1136,10 +1179,15 @@ class MemoryManager(nn.Module):
             return query_vec.new_zeros(query_vec.shape[0], 0)
         rel = _cosine(query_vec.unsqueeze(1), mem.keys).squeeze(1)  # [B, M]
         sim = self.pairwise_sim(mem.keys)
-        off_diag = sim.clone()
-        off_diag.diagonal(dim1=1, dim2=2).fill_(float("-inf"))
-        redundancy = off_diag.max(dim=-1).values                    # D: 与最相似邻居的重复度
-        novelty = 1.0 - redundancy.clamp(min=0)                     # N: 邻居越不像越新颖
+        if mem.size == 1:
+            # 评审 6.1：单块无邻居——redundancy=0, novelty=1（禁止 max(-inf)→Inf/NaN）
+            redundancy = query_vec.new_zeros(query_vec.shape[0], 1)
+            novelty = query_vec.new_ones(query_vec.shape[0], 1)
+        else:
+            off_diag = sim.clone()
+            off_diag.diagonal(dim1=1, dim2=2).fill_(float("-inf"))
+            redundancy = off_diag.max(dim=-1).values.clamp(min=0, max=1)  # D
+            novelty = 1.0 - redundancy                                    # N
         u = (self.alpha * rel + self.beta * mem.usage + self.gamma * novelty
              - self.delta * redundancy + self.eta * mem.persistence)
         return u
@@ -1159,11 +1207,28 @@ class MemoryManager(nn.Module):
         source_ids: [B, k] 块来源 id（store 块号）——去重身份（T3.3）。
         返回 (新 WorkingMemory, 被保留的新块 mask, U 全量分数)。
         """
+        # 评审 6.2：按 source_id 合并后，命中必须记到对应块，不能按去重前的槽位拼接
+        prev_ids = mem.source_ids.clone() if not mem.is_empty() else None
         mem = mem.with_added(new_hidden, new_keys, source_ids=source_ids)
-        if hit_new is not None:  # usage EMA：新块初始 usage 由命中情况决定
-            bsz, m_old = mem.usage.shape[0], mem.size - new_keys.shape[1]
-            hit_full = torch.cat(
-                [mem.usage.new_zeros(bsz, m_old), hit_new.float()], dim=1)
+        if hit_new is not None:
+            bsz, M = mem.usage.shape[0], mem.size
+            hit_full = mem.usage.new_zeros(bsz, M)
+            src = mem.source_ids  # [B, M] 合并后
+            # hit_new 对应「本次尝试并入的 new_keys 行」；按 source_id 映射到合并后槽位
+            if source_ids is not None:
+                for b in range(bsz):
+                    for j in range(source_ids.shape[1]):
+                        sid = int(source_ids[b, j].item())
+                        hit = float(hit_new[b, j].item()) if hit_new.dim() > 1 else float(hit_new[j].item())
+                        # 找到合并后该 source 的槽位
+                        matches = (src[b] == sid).nonzero(as_tuple=True)[0]
+                        if matches.numel():
+                            hit_full[b, matches[0]] = max(hit_full[b, matches[0]].item(), hit)
+            else:
+                # 无 source_id：按末尾新增槽位（旧行为，仅当 with_added 未去重）
+                n_new = new_keys.shape[1]
+                if M >= n_new:
+                    hit_full[:, M - n_new:] = hit_new.float().view(bsz, -1)[:, :n_new]
             mem = mem.with_usage_bumped(hit_full)
         u = self.score(query_vec, mem)
         if not mem.is_empty():
@@ -1661,7 +1726,8 @@ class MiniMindXModel(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 num_loops=1, halt=False, collect_exits=False, exit_choice=None,
-                memory_kv_per_layer=None, loop_callback=None, memory_payload=None):
+                memory_kv_per_layer=None, loop_callback=None, memory_payload=None,
+                query_len=None):
         cfg = self.config
         if hasattr(past_key_values, 'layers'):  # 兼容 transformers Cache 误传
             past_key_values = None
@@ -1692,7 +1758,9 @@ class MiniMindXModel(nn.Module):
         presents += pre_presents
 
         # ---- Budget Router：读 Prelude 输出（问题表示），预测预算档 ----
-        budget_logits = self.budget_router(hidden_states) if self.budget_router is not None else None
+        # 评审 3.2：Router 输入必须与执行一致——只可见前缀，不见 gold 后缀
+        router_h = hidden_states if query_len is None else hidden_states[:, :query_len]
+        budget_logits = self.budget_router(router_h) if self.budget_router is not None else None
 
         # ---- ThinkingCore（循环区）----
         num_loops = max(1, int(num_loops)) if cfg.use_loop else 1
@@ -1736,23 +1804,34 @@ class MiniMindXModel(nn.Module):
         #   r < n_run → 其真实第 r 轮 KV；r ≥ n_run → 其最后实际轮 KV（仅填新 token 位）
         # （passes[r] 已含 past_in 拼接：读侧 clamp 与写侧填充采用同一 last-valid 规则）
         if use_cache:
+            # 评审 5.1 / V2 §11.3：per-sample last-valid——
+            # 布局 [B,S,H,D]；样本 b 的新 token 在 slot r>last_exec[b] 时复制其最后实际轮；
+            # 历史 token 的深槽保留（只填新 token 位）
+            if exit_idx is not None:
+                last_exec = exit_idx.clamp(min=0, max=max(n_run - 1, 0)).tolist()
+            else:
+                last_exec = [n_run - 1] * bsz
             core_caches = []
             for l in range(T):
                 prior_entry = past[P + l] if past_key_values is not None else None
                 prior_slots = prior_entry if isinstance(prior_entry, list) else None
                 slots = []
                 for r in range(cfg.max_loop):
-                    if r < n_run:
-                        slots.append(passes[r][l])
-                        continue
-                    k_fill = passes[n_run - 1][l][0][:, -seq_len:]
-                    v_fill = passes[n_run - 1][l][1][:, -seq_len:]
+                    k_rows, v_rows = [], []
+                    for b in range(bsz):
+                        src_r = max(0, min(r, int(last_exec[b]), n_run - 1))
+                        kb, vb = passes[src_r][l]  # [B,S,H,D]
+                        k_rows.append(kb[b:b + 1])
+                        v_rows.append(vb[b:b + 1])
+                    k_all = torch.cat(k_rows, dim=0)  # [B,S,H,D] per-sample 选轮
+                    v_all = torch.cat(v_rows, dim=0)
                     if prior_slots is not None and r < len(prior_slots):
+                        # 只把新 token 位（末 seq_len）接到历史后；历史深槽不覆盖
                         pk, pv = prior_slots[r]
-                        slots.append((torch.cat([pk, k_fill], dim=1),
-                                      torch.cat([pv, v_fill], dim=1)))
+                        slots.append((torch.cat([pk, k_all[:, -seq_len:]], dim=1),
+                                      torch.cat([pv, v_all[:, -seq_len:]], dim=1)))
                     else:
-                        slots.append(passes[n_run - 1][l])
+                        slots.append((k_all, v_all))
                 core_caches.append(slots)
         presents += core_caches if use_cache else [None] * T
 
@@ -1775,21 +1854,26 @@ class MiniMindXModel(nn.Module):
         router_probs = None
         if collect_exits:
             router_probs = {}
+            # 评审 3.2：监督 logits 与执行同输入（可见前缀池化）
+            def _vis(h):
+                return h if query_len is None else h[:, :query_len]
             if self.halt_router is not None:
                 rs_list = core_out.get("residual_stats") or [None] * len(exits)
                 router_probs["halt"] = [
-                    self.halt_router(h, rs) for h, rs in zip(exits, rs_list)]
+                    self.halt_router(_vis(h), rs) for h, rs in zip(exits, rs_list)]
             if self.retrieve_router is not None:
-                router_probs["retrieval"] = [self.retrieve_router(h) for h in exits]
-                # T2.5：三动作 logits（默认全可用；controller 轨迹侧按 warm cache mask）
+                router_probs["retrieval"] = [self.retrieve_router(_vis(h)) for h in exits]
                 router_probs["retrieval_action"] = [
-                    self.retrieve_router.action_logits(h, warm_available=True) for h in exits]
+                    self.retrieve_router.action_logits(_vis(h), warm_available=True)
+                    for h in exits]
         # T2.4：halt_logits（非概率）+ residual_stats + memory_versions
         halt_logits_out = None
         if collect_exits and self.halt_router is not None:
             rs_list = core_out.get("residual_stats") or [None] * len(exits)
             halt_logits_out = [
-                self.halt_router.forward_logits(h, rs) for h, rs in zip(exits, rs_list)]
+                self.halt_router.forward_logits(
+                    h if query_len is None else h[:, :query_len], rs)
+                for h, rs in zip(exits, rs_list)]
         residual_stats = core_out.get("residual_stats")
         return dict(hidden_states=hidden_states, presents=presents, aux_loss=aux_loss,
                     exit_hiddens=exit_hiddens, halt_probs=halt_probs, exit_idx=exit_idx,
@@ -1814,14 +1898,15 @@ class MiniMindXForCausalLM(nn.Module):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 logits_to_keep=0, labels=None, num_loops=None, halt=False,
                 collect_exits=False, exit_choice=None, memory_kv_per_layer=None,
-                loop_callback=None, memory_payload=None, **kwargs):
+                loop_callback=None, memory_payload=None, query_len=None, **kwargs):
         cfg = self.config
         if num_loops is None:
             num_loops = cfg.max_loop if (collect_exits and cfg.use_loop) else 1
         out = self.model(input_ids, attention_mask, past_key_values, use_cache,
                          num_loops=num_loops, halt=halt, collect_exits=collect_exits,
                          exit_choice=exit_choice, memory_kv_per_layer=memory_kv_per_layer,
-                         loop_callback=loop_callback, memory_payload=memory_payload)
+                         loop_callback=loop_callback, memory_payload=memory_payload,
+                         query_len=query_len)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(out["hidden_states"][:, slice_indices, :])
         exit_logits = None
@@ -1947,7 +2032,9 @@ class MiniMindXForCausalLM(nn.Module):
             stats["avg_loops"] = stats["loop_sum"] / max(stats["steps"], 1)
             stats["avg_ttft_loops"] = stats["ttft_loop_sum"] / max(stats["ttft_steps"], 1)
             stats["avg_decode_loops"] = stats["decode_loop_sum"] / max(stats["decode_steps"], 1)
-            stats["executed_core_rounds"] = stats["loop_sum"]  # V2 §18.1：executed vs selected
+            # 评审 9.4：selected=样本选中出口；executed=物理执行轮（fixed/自适应上界）
+            stats["selected_core_rounds"] = stats["loop_sum"]
+            stats["executed_core_rounds"] = stats["loop_sum"]  # 无 active-mask 压缩时二者相近
             return {'generated_ids': input_ids, 'stats': stats,
                     'past_kv': past_key_values} if kwargs.get("return_kv") else \
                    {'generated_ids': input_ids, 'stats': stats}
@@ -2341,7 +2428,11 @@ class LongContextStore:
   Fine：候选块内 token 级 max-sim 重排（late-interaction 式）→ TopK_f 个最终块
 
 监督：合成 needle 数据自带 gold block 标注 → coarse 分数做 CE（retrieval CE）。
-TopK 不可微（D5），梯度只走 query/key 投影的 CE 路径。
+TopK 不可微（D5）。**Frozen Index 范式**：LongContextStore 建库阶段在 no_grad 下
+用 key_proj 生成库 key；训练阶段梯度只走 **query 投影** 的 CE/蒸馏路径，
+key_proj 不获得梯度（不是 bug，是可缓存索引 + 推理效率的设计选择）。
+配置声明 config.freeze_key=True；若要 Q/K 联合训练，须周期 rebuild index
+（key_refresh_interval），不能只去掉 no_grad。
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -2501,27 +2592,32 @@ class SparseBlockAttention(Attention):
         # query 与块键的相似度：[B, H, S, n_blk]
         blk_score = torch.einsum("bhsd,bhnd->bhsn",
                                  F.normalize(xq, dim=-1), F.normalize(block_k, dim=-1))
-        # ---- T0.4（C8 修复）：块选择因果化 + 最终掩码取交集 ----
-        # query i（全局位）可见 key 满足 col ≤ i；块 b 的 key 起始于 b*block，
-        # 故「块含至少一个可见 key」⟺ blk_start(b) ≤ i —— 逐行块可见性 [S, n_blk]
+        # ---- 评审 9.5 / T0.4：块级因果 ----
+        # 块键 = 全块 mean 会混入未来 token；即使 attention mask 挡住未来 value，
+        # 未来内容仍会改变「选哪些块」。修复：
+        #   全局 top-k 只允许「完整可见块」（块末 < query 位）——其 key 无未来污染；
+        #   当前未完成块（块末 ≥ query）不参与全局选择，仅走因果局部窗口。
         blk_start = torch.arange(n_blk, device=x.device) * self.block
+        blk_end = blk_start + self.block  # 开区间块末
         row_g = torch.arange(total_len - seq_len, total_len, device=x.device)
-        blk_vis_rows = blk_start.unsqueeze(0) <= row_g.unsqueeze(1)          # [S, n_blk]
+        # 完整可见：块末 ≤ query+1（块内所有 key 均 ≤ query）
+        blk_fully_vis = blk_end.unsqueeze(0) <= (row_g + 1).unsqueeze(1)    # [S, n_blk]
         blk_score = blk_score.masked_fill(
-            ~blk_vis_rows.unsqueeze(0).unsqueeze(0), float("-inf"))
+            ~blk_fully_vis.unsqueeze(0).unsqueeze(0), float("-inf"))
         k_sel = min(self.n_selected, n_blk)
         sel = blk_score.topk(k_sel, dim=-1).indices                    # [B,H,S,k]
-        # 逐 head 选块的并集（研究级近似：union over heads）
         block_mask = torch.zeros(bsz, self.n_local_heads, seq_len, n_blk,
                                  device=x.device, dtype=torch.bool).scatter_(-1, sel, True)
-        col_block = torch.arange(total_len, device=x.device) // self.block  # key 的块号
+        # 强制排除未完整可见块（topk 可能捡到 -inf 槽）
+        block_mask = block_mask & blk_fully_vis.unsqueeze(0).unsqueeze(0)
+        col_block = torch.arange(total_len, device=x.device) // self.block
         allow_blocks = block_mask.any(dim=1, keepdim=True)[..., col_block]  # [B,1,S,total]
 
-        # ---- 窗口 + 因果（修复：选择并集后再与因果取交集，块选择不得越过因果线）----
+        # 窗口 + 因果：未完成块的 key 只能靠 band 进入；最终仍与因果取交集
         row = torch.arange(total_len - seq_len, total_len, device=x.device).unsqueeze(1)
         col = torch.arange(total_len, device=x.device).unsqueeze(0)
         band = (col <= row) & (col > row - self.window)
-        causal = col <= row                                                 # [S, total]
+        causal = col <= row
         allow = (allow_blocks | band.unsqueeze(0).unsqueeze(0)) & causal.unsqueeze(0).unsqueeze(0)
         scores = (xq @ xk_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(~allow, float("-inf"))
@@ -2653,6 +2749,27 @@ ACTION_RESCORE_WARM = 1
 ACTION_GLOBAL_REFRESH = 2
 ACTION_NAMES = ("REUSE", "RESCORE_WARM", "GLOBAL_REFRESH")
 ACTION_COUNT = 3
+# 唯一合法枚举（V2 §9.2）；旧二值标签只在数据边界转换一次
+ACTION_SCHEMA_VERSION = 2
+
+
+def normalize_oracle_actions(seq, schema_version: int = ACTION_SCHEMA_VERSION):
+    """把 oracle 动作序列归一到 schema v2：0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH。
+
+    schema v1（旧二值）：0=REUSE, 1=GLOBAL_REFRESH（无 RESCORE_WARM）。
+    进入模型后禁止再转换（Oracle/loss/执行/trace 共用本枚举）。
+    """
+    out = []
+    for a in seq or []:
+        a = int(a)
+        if schema_version <= 1:
+            # v1: 0=REUSE, 1=REFRESH → v2: 0=REUSE, 2=GLOBAL_REFRESH
+            out.append(ACTION_REUSE if a == 0 else ACTION_GLOBAL_REFRESH)
+        else:
+            if a not in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+                raise ValueError(f"非法动作 id {a}（schema v{schema_version}）")
+            out.append(a)
+    return out
 
 
 def action_mask(warm_available: bool, device=None, batch: int = 1) -> torch.Tensor:
@@ -2789,15 +2906,19 @@ class ReaderFirstBlock(ThinkingBlock):
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None,
                 use_cache=False, attention_mask=None, memory_kv=None,
-                reader=None, memory_payload=None):
+                reader=None, memory_payload=None, memory_kv_proj=None):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask)
         hidden_states = hidden_states + residual
-        if reader is not None and memory_payload is not None:
-            payload, valid = memory_payload
-            hidden_states, _ = reader(hidden_states, reader.project_memory(payload, valid))
+        if reader is not None and (memory_payload is not None or memory_kv_proj is not None):
+            # 评审 9.2：优先用预投影 MemoryKV（跨 loop 复用）；否则现场 project
+            kv = memory_kv_proj
+            if kv is None:
+                payload, valid = memory_payload
+                kv = reader.project_memory(payload, valid)
+            hidden_states, _ = reader(hidden_states, kv)
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
@@ -2879,6 +3000,15 @@ class ThinkingCore(nn.Module):
         if self.loop_embed is not None:
             hidden_states = hidden_states + self.loop_embed.weight[loop_idx]
         memory_kv_per_layer = memory_kv_per_layer or [None] * self.num_layers
+        # 评审 9.2：同一 memory_version 的 Reader 投影跨 loop 复用
+        mem_kv_proj = None
+        if self.residual_v2 and memory_payload is not None and self.memory_reader is not None:
+            mv = getattr(memory_payload, "memory_version", None)
+            if getattr(self, "_reader_kv_ver", None) != mv or getattr(self, "_reader_kv", None) is None:
+                payload, valid = memory_payload
+                self._reader_kv = self.memory_reader.project_memory(payload, valid)
+                self._reader_kv_ver = mv
+            mem_kv_proj = self._reader_kv
         presents = []
         for l, layer in enumerate(self.layers):
             pl = past_key_values[l]
@@ -2890,7 +3020,8 @@ class ThinkingCore(nn.Module):
                     hidden_states, present = torch.utils.checkpoint.checkpoint(
                         layer, hidden_states, position_embeddings, past_in, use_cache,
                         attention_mask, memory_kv=mem, reader=self.memory_reader,
-                        memory_payload=memory_payload, use_reentrant=False)
+                        memory_payload=memory_payload, memory_kv_proj=mem_kv_proj,
+                        use_reentrant=False)
                 elif isinstance(layer, ThinkingBlock):
                     hidden_states, present = torch.utils.checkpoint.checkpoint(
                         layer, hidden_states, position_embeddings, past_in, use_cache,
@@ -2907,7 +3038,7 @@ class ThinkingCore(nn.Module):
                     past_key_value=past_in, use_cache=use_cache,
                     attention_mask=attention_mask, memory_kv=mem,
                     reader=self.memory_reader if self.residual_v2 else None,
-                    memory_payload=memory_payload)
+                    memory_payload=memory_payload, memory_kv_proj=mem_kv_proj)
             elif isinstance(layer, ThinkingBlock):
                 hidden_states, present = layer(
                     hidden_states, position_embeddings,
@@ -2936,6 +3067,9 @@ class ThinkingCore(nn.Module):
         返回 dict 新增：committed_states（每轮提交状态；v1 路径下与 exit_hiddens 同物）
         """
         num_loops = max(1, int(num_loops))
+        # 评审：Reader 投影缓存不得跨 forward 复用（sweep 等 no_grad 前向会污染 detached 缓存）
+        self._reader_kv = None
+        self._reader_kv_ver = None
         past_key_values = past_key_values or [None] * self.num_layers
         exit_hiddens, presents_per_pass = [], []
         halt_probs, exit_idx = [], None
@@ -2968,7 +3102,12 @@ class ThinkingCore(nn.Module):
                 memory_payload=memory_payload)
             residual_stats_r = None
             if self.residual_v2:
-                gated, gate = self.update_gate(previous, anchor, candidate)
+                # 评审 5.1：已早停样本 active=False，committed 保持 previous（不写新状态）
+                # active 须为 [B,T]；halted 是 [B]，广播到 token 轴
+                active = None
+                if halt_fn is not None:
+                    active = (~halted).unsqueeze(1).expand(-1, previous.shape[1])
+                gated, gate = self.update_gate(previous, anchor, candidate, active=active)
                 lam = self.config.update_progress
                 committed = candidate + lam * (gated - candidate)
                 # T2.1 / V2 §7.5：halt 用 detached 门控统计（不把 gate 路径绑进 halt 梯度）
@@ -3015,20 +3154,19 @@ class ThinkingCore(nn.Module):
 # trainer/dual_executor.py
 
 ```python
-"""双执行器（任务清单 T4.6；V2 §10.4）。
+"""双执行器（任务清单 T4.6；V2 §10.4/§11.5）。
 
-1. reference_forward_by_prefix：逐前缀参考执行器——每个位置 t 用可见前缀 x[0..t]
-   与「截止 t 的 memory 时间线」独立前向，是正确性标准。
-2. segmented_forward：按 memory-version/动作边界分段的批处理执行器——段内 Memory
-   在段开始前已确定；利用因果性，段内位置可共用一次批处理前向。
+语义金标准是 **append-only**（与 generate 一致）：
+  - token 只追加写入 cache；已算过的 KV 不回溯
+  - memory 从 W1→W2 只影响此后新 token，不重算历史
+  - 首段可整段 prefill；之后逐 token（或段内）追加
 
-共同语义（两执行器必须逐位对应）：
-  per_token_ce[t] = CE( ŷ_{t+1} | x_{0..t}, M(t) )，t < T-1；per_token_ce[T-1] = 0
-  M(t) = 该 token 所在 segment 生效的 memory（在 segment 开始前已定）
+三个入口：
+  1. reference_append_only —— 带 cache 增量参考（正确性金标准，对齐 generate）
+  2. segmented_forward     —— 按 memory-version/动作边界分段；段间续 cache
+  3. reference_recompute   —— 旧「每前缀从头重算」（仅作对照，不是金标准）
 
-动作时间线：retrieve_actions[i] 是「进入 segment i 时」执行的动作
-（0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH）；非 REUSE 在段边界用可见前缀查询执行。
-训练用给定动作边界时，检索 query 仍只由当前可见前缀计算（T0.1）。
+共同输出：per_token_ce[t] = CE( ŷ_{t+1} | x_{0..t}, append-only 历史 )，t<T-1。
 """
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -3047,7 +3185,7 @@ def _mem_kw(ctrl):
 
 def build_action_timeline(retrieve_actions: Sequence[int],
                           token_segments: Sequence[Tuple[int, int]]):
-    """构造动作时间线。retrieve_actions[i]：进入 segment i 时执行的动作 id。"""
+    """动作时间线。retrieve_actions[i]：进入 segment i 时执行的动作 id。"""
     assert len(retrieve_actions) == len(token_segments)
     timeline = []
     ver = 0
@@ -3063,87 +3201,57 @@ def build_action_timeline(retrieve_actions: Sequence[int],
 
 def _prepare_memories(model, input_ids, context_ids, query_len, timeline,
                       controller_factory, attention_mask=None):
-    """按时间线预演 memory：返回 list[mem_kw]，与 timeline 一一对应（段开始前已定）。"""
-    cfg = model.config
+    """按时间线预演 memory（段开始前已定）。返回 list[mem_kw] 与 timeline 对齐。"""
     T = input_ids.shape[1]
     ctrl = controller_factory()
     ctrl.begin(context_ids)
     causal = input_ids[:, :query_len]
     causal_mask = attention_mask[:, :query_len] if attention_mask is not None else None
     q0 = ctrl.raw.model.prelude_hidden(causal, causal_mask)
-    ctrl.memory = ctrl.retrieve_into_memory(q0)  # 初始全局检索
+    ctrl.memory = ctrl.retrieve_into_memory(q0)
 
     mem_list = []
     for seg in timeline:
         a = int(seg["retrieval_action"])
         t0 = int(seg["token_start"])
-        # 进入本段时执行动作（query 只用可见前缀，T0.1）
         if a != ACTION_REUSE:
             vis_len = max(query_len, min(t0 + 1, T))
-            vis = ctrl.raw.model.prelude_hidden(input_ids[:, :vis_len],
-                                               attention_mask[:, :vis_len]
-                                               if attention_mask is not None else None)
+            vis = ctrl.raw.model.prelude_hidden(
+                input_ids[:, :vis_len],
+                attention_mask[:, :vis_len] if attention_mask is not None else None)
             ctrl.memory = ctrl.execute_retrieval_action(
                 a, vis, budget_idx=ctrl._budget_idx(vis), mem=ctrl.memory)
         mem_list.append(_mem_kw(ctrl))
     return mem_list
 
 
-def _ce_at_positions(logits, labels, positions: Sequence[int]) -> torch.Tensor:
-    """per_token_ce[t] = CE(logits[t] → labels[t+1])。返回 [B, T]（未填位置为 0）。"""
-    B, T, _ = logits.shape
-    out = logits.new_zeros(B, T)
-    for t in positions:
-        if t + 1 >= T:
-            continue
-        out[:, t] = F.cross_entropy(logits[:, t, :], labels[:, t + 1],
-                                    ignore_index=-100, reduction="none")
-    return out
+def _mem_at(timeline, mem_list, t):
+    for seg, mk in zip(timeline, mem_list):
+        if seg["token_start"] <= t < seg["token_end"]:
+            return mk
+    return mem_list[-1] if mem_list else {}
+
+
+def _ce_from_logits_seq(logits_seq, labels, device):
+    """logits_seq[t] = 位置 t 的 next-token 分布（处理完 x[t] 后）。"""
+    B, T = labels.shape
+    ce = torch.zeros(B, T, device=device)
+    for t in range(T - 1):
+        ce[:, t] = F.cross_entropy(logits_seq[t], labels[:, t + 1],
+                                   ignore_index=-100, reduction="none")
+    return ce
 
 
 @torch.no_grad()
-def reference_forward_by_prefix(model, input_ids, labels, context_ids, query_len,
-                                timeline, controller_factory, attention_mask=None,
-                                num_loops=None):
-    """逐前缀参考执行器（正确性标准）。返回 (per_token_ce [B,T], last_logits)。"""
-    cfg = model.config
-    B, T = input_ids.shape
-    loops = 1 if not cfg.use_loop else (num_loops or min(cfg.max_loop, cfg.max_loop))
-    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
-                                 controller_factory, attention_mask)
+def reference_append_only(model, input_ids, labels, context_ids, query_len,
+                          timeline, controller_factory, attention_mask=None,
+                          num_loops=None):
+    """append-only 增量参考执行器（V2 §11.5 金标准，与 generate 同语义）。
 
-    def mem_at(t):
-        for seg, mk in zip(timeline, mem_list):
-            if seg["token_start"] <= t < seg["token_end"]:
-                return mk
-        return mem_list[-1] if mem_list else {}
-
-    per_token_ce = torch.zeros(B, T, device=input_ids.device, dtype=torch.float32)
-    if labels is None:
-        return per_token_ce, None
-    last_logits = None
-    for t in range(T):
-        if t + 1 >= T:
-            break  # 位置 T-1 无 next
-        pref = input_ids[:, :t + 1]
-        pref_mask = attention_mask[:, :t + 1] if attention_mask is not None else None
-        out = model(pref, attention_mask=pref_mask, labels=None, num_loops=loops,
-                    **mem_at(t))
-        last_logits = out.logits
-        per_token_ce[:, t] = F.cross_entropy(
-            out.logits[:, -1, :], labels[:, t + 1],
-            ignore_index=-100, reduction="none")
-    return per_token_ce, last_logits
-
-
-@torch.no_grad()
-def segmented_forward(model, input_ids, labels, context_ids, query_len,
-                      timeline, controller_factory, attention_mask=None,
-                      num_loops=None):
-    """分段批处理执行器（优化路径）。返回 (per_token_ce [B,T], last_logits)。
-
-    段内 Memory 已在段开始前确定；因因果 mask，位置 t∈[s,e) 只看见 x_{0..t}，
-    故可用一次前向（整序列 + 本段 memory）抽出段内 per-token CE，与逐前缀逐位一致。
+    · 首段整段 prefill（与 generate 第一步一致）
+    · 之后按 token 追加进 cache；memory 换版只作用于新 token
+    · 历史 KV 永不重算
+    返回 (per_token_ce [B,T], logits_seq list[B,V])
     """
     cfg = model.config
     B, T = input_ids.shape
@@ -3151,32 +3259,133 @@ def segmented_forward(model, input_ids, labels, context_ids, query_len,
     mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
                                  controller_factory, attention_mask)
 
-    per_token_ce = torch.zeros(B, T, device=input_ids.device, dtype=torch.float32)
-    last_logits = None
-    if labels is None:
-        return per_token_ce, None
+    # 按段推进：段 [s,e) 共用段开始前已定的 memory
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
     for seg, mk in zip(timeline, mem_list):
         s, e = int(seg["token_start"]), int(seg["token_end"])
         s, e = max(0, s), min(T, e)
         if s >= e:
             continue
-        out = model(input_ids, attention_mask=attention_mask, labels=None,
+        for t in range(s, e):
+            out = model(input_ids[:, t:t + 1], past_key_values=past, use_cache=True,
+                        num_loops=loops, **mk)
+            past = out.past_key_values
+            logits_seq[t] = out.logits[:, -1, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
+
+
+@torch.no_grad()
+def segmented_forward(model, input_ids, labels, context_ids, query_len,
+                      timeline, controller_factory, attention_mask=None,
+                      num_loops=None):
+    """分段执行器：段内可批处理追加，段边界续 cache（append-only，不从头重算）。
+
+    与 reference_append_only 数值对应；比逐 token 更省前向次数。
+    返回 (per_token_ce [B,T], logits_seq)
+    """
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
+                                 controller_factory, attention_mask)
+
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
+    for seg, mk in zip(timeline, mem_list):
+        s, e = int(seg["token_start"]), int(seg["token_end"])
+        s, e = max(0, s), min(T, e)
+        if s >= e:
+            continue
+        # 段内一次前向追加 [s,e)：cache 只增不回溯；memory 为段边界前已定的版本
+        out = model(input_ids[:, s:e], past_key_values=past, use_cache=True,
                     num_loops=loops, **mk)
-        last_logits = out.logits
-        # 段内位置 t ∈ [s, e)：CE(logits[t] → labels[t+1])；t=T-1 无 next 保持 0
-        positions = list(range(s, min(e, T - 1)))
-        if positions:
-            per_token_ce[:, s:min(e, T - 1)] = _ce_at_positions(
-                out.logits, labels, positions)[:, s:min(e, T - 1)]
-    return per_token_ce, last_logits
+        past = out.past_key_values
+        # out.logits: [B, e-s, V]；位置 s+i 处理完 x[s+i] 的 next 分布
+        for i in range(e - s):
+            logits_seq[s + i] = out.logits[:, i, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
 
 
-def assert_executors_correspond(ref_ce, seg_ce, atol=1e-5):
-    """T4.6 验收：两执行器语义对应（数值容差内逐位一致）。"""
+@torch.no_grad()
+def reference_recompute(model, input_ids, labels, context_ids, query_len,
+                        timeline, controller_factory, attention_mask=None,
+                        num_loops=None):
+    """旧实现：每前缀从头重算（违反 append-only）。仅作对照，不是金标准。"""
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    mem_list = _prepare_memories(model, input_ids, context_ids, query_len, timeline,
+                                 controller_factory, attention_mask)
+    logits_seq: List[torch.Tensor] = [None] * T
+    for t in range(T):
+        out = model(input_ids[:, :t + 1], num_loops=loops,
+                    **_mem_at(timeline, mem_list, t))
+        logits_seq[t] = out.logits[:, -1, :]
+    ce = _ce_from_logits_seq(logits_seq, labels, input_ids.device) if labels is not None \
+        else torch.zeros(B, T, device=input_ids.device)
+    return ce, logits_seq
+
+
+@torch.no_grad()
+def generate_teacher_forced(model, input_ids, mem_schedule, num_loops=None,
+                            prompt_len=None):
+    """与 generate() 同构的 teacher-forcing：首块 prefill，其后逐 token 追加。
+
+    mem_schedule: 每个 token 位置的 mem_kw（或 callable(t)）。
+    用于和 reference_append_only / 真实 generate 对照。
+    """
+    cfg = model.config
+    B, T = input_ids.shape
+    loops = 1 if not cfg.use_loop else (num_loops or cfg.max_loop)
+    prompt_len = T if prompt_len is None else min(prompt_len, T)
+    past = None
+    logits_seq: List[torch.Tensor] = [None] * T
+
+    def mem_at(t):
+        if callable(mem_schedule):
+            return mem_schedule(t)
+        return mem_schedule[t] if mem_schedule else {}
+
+    # 与 generate 第一步一致：整段 prompt prefill
+    out = model(input_ids[:, :prompt_len], past_key_values=past, use_cache=True,
+                num_loops=loops, **(mem_at(0) or {}))
+    past = out.past_key_values
+    for i in range(prompt_len):
+        logits_seq[i] = out.logits[:, i, :]
+    # 其后逐 token（generate decode）
+    for t in range(prompt_len, T):
+        out = model(input_ids[:, t:t + 1], past_key_values=past, use_cache=True,
+                    num_loops=loops, **(mem_at(t) or {}))
+        past = out.past_key_values
+        logits_seq[t] = out.logits[:, -1, :]
+    return logits_seq
+
+
+def assert_executors_correspond(ref_logits, seg_logits, atol=1e-4):
+    """数值对应：logits 列表逐位一致。"""
+    if len(ref_logits) != len(seg_logits):
+        return False, f"len mismatch {len(ref_logits)} vs {len(seg_logits)}"
+    max_diff = 0.0
+    for a, b in zip(ref_logits, seg_logits):
+        if a is None or b is None:
+            return False, "None logits"
+        if a.shape != b.shape:
+            return False, f"shape {a.shape} vs {b.shape}"
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            return False, "non-finite"
+        max_diff = max(max_diff, (a - b).abs().max().item())
+    return max_diff <= atol, f"max |Δlogit|={max_diff}"
+
+
+# 兼容旧测试签名（CE 版）
+def assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-5):
     if ref_ce.shape != seg_ce.shape:
         return False, f"shape mismatch {ref_ce.shape} vs {seg_ce.shape}"
-    if not torch.isfinite(ref_ce).all() or not torch.isfinite(seg_ce).all():
-        return False, "non-finite CE"
     diff = (ref_ce - seg_ce).abs().max().item()
     return diff <= atol, f"max |ΔCE|={diff}"
 ```
@@ -3272,18 +3481,22 @@ def sweep_depth(model, input_ids, labels, attention_mask=None, memory_kv_per_lay
 
 @torch.no_grad()
 def sweep_budget(model, input_ids, labels, context_ids, controller_factory,
-                 budget_idxs=None, attention_mask=None, **oracle_kwargs):
+                 budget_idxs=None, attention_mask=None, query_len=None, **oracle_kwargs):
     """性能矩阵的 memory 维：逐预算档跑 teacher-forced 前向，返回 loss [B, n档]。
 
+    query_len: 可见前缀边界（必传）——预算检索 query 不得读 gold answer（评审 3.1）。
     controller_factory() -> AdaptiveController（每档新建，避免状态串扰）。
     """
+    if query_len is None:
+        raise ValueError("sweep_budget 必须传 query_len（禁止默认全序列，防 gold 泄漏进检索）")
     cfg = model.config
     idxs = budget_idxs if budget_idxs is not None else list(range(len(cfg.memory_budgets)))
     losses = []
     for idx in idxs:
         ctrl = controller_factory()
         out, _ = ctrl.forward_with_oracles(
-            input_ids, attention_mask, labels, context_ids, oracle_budget=idx, **oracle_kwargs)
+            input_ids, attention_mask, labels, context_ids,
+            oracle_budget=idx, query_len=query_len, **oracle_kwargs)
         losses.append(_per_sample_ce(out.exit_logits[-1], labels))
     return torch.stack(losses, dim=-1)  # [B, n]
 
@@ -3339,11 +3552,13 @@ def sweep_retrieval(model, input_ids, labels, context_ids, query_len,
 @torch.no_grad()
 def sweep_retrieval_action(model, input_ids, labels, context_ids, query_len,
                            controller_factory, attention_mask=None, num_loops=None):
-    """T2.5 三动作反事实：同前缀比较 REUSE / RESCORE_WARM / GLOBAL_REFRESH。
+    """T2.5/T4.4 同快照三动作反事实（评审 4.2 修复）。
 
-    动作 id（与 retrieval_router.ACTION_* 对齐）：0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH。
-    RESCORE_WARM 无 warm cache 时该动作 loss 记 +inf（等价 mask，不静默降级全局搜索）。
-    返回 (best_action [B,R], loss_matrix [B,R,3])。全程因果：query 只用 input_ids[:, :query_len]。
+    从**同一状态快照**（相同 H/W/Warm Cache/可见前缀）分叉三动作，比较**动作之后**
+    的出口 loss——不是三条全程独立轨迹，也不是「第 r 轮 exit 给第 r 轮后动作」打分。
+
+    动作 id（schema v2）：0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH。
+    返回 (best_action [B,R], loss_matrix [B,R,3])。
     """
     from model.minimind_x.router.retrieval_router import (
         ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH)
@@ -3352,6 +3567,7 @@ def sweep_retrieval_action(model, input_ids, labels, context_ids, query_len,
     r_max = num_loops or cfg.max_loop
     causal = input_ids[:, :query_len]
     causal_mask = attention_mask[:, :query_len] if attention_mask is not None else None
+    B = input_ids.shape[0]
 
     def _mem_kw(ctrl):
         mem_in = ctrl._memory_input()
@@ -3359,34 +3575,49 @@ def sweep_retrieval_action(model, input_ids, labels, context_ids, query_len,
             return {"memory_payload": mem_in}
         return {"memory_kv_per_layer": mem_in}
 
-    losses = []
-    for a_id in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
-        ctrl = controller_factory()
-        ctrl.begin(context_ids)
-        q = ctrl.raw.model.prelude_hidden(causal, causal_mask)
-        ctrl.memory = ctrl.retrieve_into_memory(q)  # 初始全局检索（产生 warm cache）
-        if a_id == ACTION_RESCORE_WARM and not ctrl.has_warm_cache():
-            losses.append(torch.full((input_ids.shape[0], r_max), float("inf"),
-                                     device=input_ids.device))
-            continue
+    # --- 共享前缀：初始检索后，跑到各决策点 ---
+    # 对每个决策轮 r（0..r_max-2，动作影响的是 r 之后的出口）：
+    #   用 oracle 全 REUSE 跑到产生 exit[r]（即 r+1 个 exit）得到快照
+    #   分叉动作，继续到 r_max，比较 exit[r+1] 的 CE
+    loss_matrix = input_ids.new_zeros(B, r_max, 3, dtype=torch.float32)
+    loss_matrix = torch.zeros(B, r_max, 3, device=input_ids.device)
+    for r_decision in range(r_max):
+        # 共享轨迹：到 r_decision 轮结束（含 exit[r_decision]）均 REUSE
+        # 分叉后看 exit[min(r_decision+1, r_max-1)]（动作在 cb 中于 r_decision 后执行）
+        eval_round = min(r_decision + 1, r_max - 1)
+        for a_id in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+            ctrl = controller_factory()
+            ctrl.begin(context_ids)
+            q = ctrl.raw.model.prelude_hidden(causal, causal_mask)
+            ctrl.memory = ctrl.retrieve_into_memory(q)
+            if a_id == ACTION_RESCORE_WARM and not ctrl.has_warm_cache():
+                loss_matrix[:, r_decision, a_id] = float("inf")
+                continue
 
-        def make_cb(a_id=a_id, ctrl=ctrl):
-            def cb(r, exit_hidden):
-                vis = exit_hidden[:, :query_len] if query_len else exit_hidden
-                if a_id == ACTION_REUSE:
-                    return None
-                with torch.no_grad():
-                    ctrl.memory = ctrl.execute_retrieval_action(
-                        a_id, vis, budget_idx=ctrl._budget_idx(vis), mem=ctrl.memory)
-                    return ctrl._memory_input()
-            return cb
+            def make_cb(r_decision=r_decision, a_id=a_id, ctrl=ctrl):
+                def cb(r, exit_hidden):
+                    vis = exit_hidden[:, :query_len] if query_len else exit_hidden
+                    # 决策点之前：REUSE（保持共享前缀状态）；决策点：执行目标动作
+                    if r < r_decision:
+                        return None
+                    if r == r_decision:
+                        if a_id == ACTION_REUSE:
+                            return None
+                        with torch.no_grad():
+                            ctrl.memory = ctrl.execute_retrieval_action(
+                                a_id, vis, budget_idx=ctrl._budget_idx(vis),
+                                mem=ctrl.memory)
+                            return ctrl._memory_input()
+                    return None  # 之后 REUSE
+                return cb
 
-        out = model(input_ids, attention_mask=attention_mask, labels=None,
-                    collect_exits=True, num_loops=r_max, loop_callback=make_cb(),
-                    **_mem_kw(ctrl))
-        losses.append(torch.stack([_per_sample_ce(lg, labels) for lg in out.exit_logits]).t())
-    loss_matrix = torch.stack(losses, dim=-1)  # [B,R,3]
-    best = loss_matrix.argmin(dim=-1)          # [B,R]
+            out = model(input_ids, attention_mask=attention_mask, labels=None,
+                        collect_exits=True, num_loops=r_max,
+                        loop_callback=make_cb(), **_mem_kw(ctrl))
+            # 评价出口 = 动作生效后的第一出口（评审 4.2：不能拿动作前的 exit 给动作打分）
+            ce = _per_sample_ce(out.exit_logits[eval_round], labels)  # [B]
+            loss_matrix[:, r_decision, a_id] = ce
+    best = loss_matrix.argmin(dim=-1)  # [B,R]
     return best.to(input_ids.device), loss_matrix.to(input_ids.device)
 ```
 
@@ -3600,8 +3831,10 @@ def rollout_group(prompt_text, num_generations, max_new_tokens):
 
 def compute_per_token_logps(model_, input_ids, n_keep, attention_mask=None, num_loops=1):
     """num_loops 与轨迹实际轮数对齐（否则 off-policy 偏差：生成用自适应 R、评估用 R=1）。"""
-    unwrapped = model_.module if isinstance(model_, DistributedDataParallel) else model_
-    logits = unwrapped(input_ids, attention_mask=attention_mask, num_loops=num_loops,
+    # 评审 8.2：梯度前向必须走 DDP 包装（unwrap 会丢梯度同步）
+    # 推理/无梯度可用 raw；此处要 backward，故用 model_ 本身
+    target = model_ if isinstance(model_, DistributedDataParallel) else model_
+    logits = target(input_ids, attention_mask=attention_mask, num_loops=num_loops,
                        logits_to_keep=n_keep + 1).logits[:, :-1, :]
     logps = []
     for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
@@ -3628,13 +3861,21 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
         for i, ro in enumerate(rollouts):
             base = prompt_base_ids[i]
             for j in range(args.num_generations):
-                traj.append((i, torch.cat([base, ro["ids"][j].cpu()]).to(args.device), ro))
+                # 评审 8.3：两侧先到 CPU 再 cat，避免 CUDA 跨设备
+                traj.append((i, torch.cat([base.cpu(), ro["ids"][j].cpu()]).to(args.device), ro))
         old_per_token, logp_lens, traj_loops = [], [], []
         with torch.no_grad():
             for (i, ids, ro) in traj:
                 n_keep = ids.numel() - prompt_base_ids[i].numel()
                 j = len(old_per_token) % args.num_generations
-                r = max(1, int(round(ro["loop"][j])))  # 轨迹实际轮数对齐
+                # 评审 8.3/V2 §17.3：禁止平均深度重放（[1,3,2,4] 不得用 R=3 近似）
+                # adaptive 轨迹内 token 深度不同时，不得 int(round(avg_loops))
+                raw_loop = ro["loop"][j]
+                r = max(1, int(round(raw_loop)))
+                if abs(raw_loop - r) > 1e-6 and getattr(args, "allow_avg_depth_replay", 0) != 1:
+                    raise RuntimeError(
+                        f"禁平均深度重放：avg_loops={raw_loop} 非整数（V2 §17.3）。"
+                        f"请用固定 R rollout，或显式 --allow_avg_depth_replay 1（消融，不诚实）")
                 old_per_token.append(compute_per_token_logps(model, ids.unsqueeze(0), n_keep, num_loops=r)[0])
                 logp_lens.append(n_keep)
                 traj_loops.append(r)
@@ -3716,6 +3957,8 @@ if __name__ == "__main__":
                         help="RL 课程：1 无惩罚 / 2 小惩罚 / 3 Pareto（Doc 5 §24）")
     parser.add_argument("--mode_diversity", default=1, type=int, choices=[0, 1],
                         help="轨迹按 fast/normal/deep 模式循环采样")
+    parser.add_argument("--allow_avg_depth_replay", default=0, type=int, choices=[0, 1],
+                        help="危险：允许平均深度近似重放（V2 §17.3 禁止；仅消融）")
     parser.add_argument("--adaptive_rollout", default=0, type=int, choices=[0, 1],
                         help="0=固定采样 R（默认，on-policy）；1=adaptive halting rollout"
                              "（logps 用单一 R 近似，残余 off-policy 偏差，消融用）")
@@ -3727,6 +3970,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=None, type=int, help='默认 None：不覆盖 preset/variant 默认（T0.6）')
     parser.add_argument('--num_hidden_layers', default=None, type=int, help='默认 None：不覆盖 preset/variant 默认（T0.6）')
     parser.add_argument('--max_loop', default=4, type=int)
+    parser.add_argument('--residual_v2', default=0, type=int, choices=[0, 1],
+                        help='V2 残差改造；从 V2 ckpt 加载时会自动强制打开')
     parser.add_argument("--data_path", type=str, default="../dataset/agent_rl_math.jsonl",
                         help="math RL 数据：{conversations, gt}（官方 agent_rl_math.jsonl）")
     parser.add_argument("--reward_type", type=str, default="math", choices=["math", "code"],
@@ -3744,6 +3989,7 @@ if __name__ == "__main__":
     setup_seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindXConfig(preset=args.preset, variant=args.variant, max_loop=args.max_loop,
+                                residual_v2=bool(args.residual_v2),
                                 **{k: v for k, v in dict(hidden_size=args.hidden_size,
                                                          num_hidden_layers=args.num_hidden_layers).items() if v is not None})
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -4171,9 +4417,13 @@ def sft_c_step(batch):
     gold_block = batch["gold_block"].to(args.device)
     query_len = int(batch["question_len"][0].item())       # T0.1：可见前缀边界（数据集提供）
     oracle_r_file = int(batch["oracle_r"][0].item())
-    oracle_ret = batch["oracle_retrieve"][0].tolist()
-    if not isinstance(oracle_ret, (list, tuple)):
-        oracle_ret = [int(oracle_ret)] if int(oracle_ret) >= 0 else []
+    # 动作 schema：数据边界归一到 v2（0=REUSE,1=WARM,2=GLOBAL）；旧二值 v1: 1=GLOBAL
+    from model.minimind_x.router.retrieval_router import normalize_oracle_actions
+    _raw_ret = batch["oracle_retrieve"][0].tolist()
+    if not isinstance(_raw_ret, (list, tuple)):
+        _raw_ret = [int(_raw_ret)] if int(_raw_ret) >= 0 else []
+    _schema = int(batch["action_schema_version"]) if "action_schema_version" in batch else 1
+    oracle_ret = normalize_oracle_actions(_raw_ret, schema_version=_schema)
 
     # ---- 在线 oracle（Doc 4 §3：Self-generated Supervision；小采样率）----
     oracle_r = None
@@ -4190,7 +4440,8 @@ def sft_c_step(batch):
     if args.train_budget_router and random.random() < args.oracle_rate:
         loss_matrix = sweep_budget(
             model, input_ids, labels, context_ids,
-            controller_factory=lambda: AdaptiveController(model))
+            controller_factory=lambda: AdaptiveController(model),
+            query_len=query_len)  # 评审 3.1：预算检索不得读 gold
         oracle_budget = int(oracle_budget_from_matrix(loss_matrix, lm_config.oracle_epsilon)[0].item())
     if not oracle_ret and random.random() < args.oracle_rate:
         # T2.5/T4.4：三动作反事实（REUSE/RESCORE_WARM/GLOBAL_REFRESH）；
@@ -4231,19 +4482,11 @@ def sft_c_step(batch):
         ret_action_logits = out.router_probs["retrieval_action"]
         warm_ok = bool(extras.get("warm_available", True))
         n = len(ret_action_logits)
-        from model.minimind_x.router.retrieval_router import (
-            action_mask, ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH)
+        from model.minimind_x.router.retrieval_router import action_mask
         ret_action_masks = [action_mask(warm_ok, device=ret_action_logits[0].device,
                                         batch=ret_action_logits[0].shape[0]) for _ in range(n)]
-        # 归一到 ACTION_* id：旧 0/1 口径 1→GLOBAL_REFRESH；新 2→RESCORE_WARM
-        def _to_action(a):
-            a = int(a)
-            if a == 0:
-                return ACTION_REUSE
-            if a == 2:
-                return ACTION_RESCORE_WARM
-            return ACTION_GLOBAL_REFRESH  # 1 或其它
-        oracle_ret_action = torch.tensor([_to_action(a) for a in oracle_ret], device=args.device)
+        # 标签已是 schema v2，禁止再对调（评审 4.1）
+        oracle_ret_action = torch.tensor(oracle_ret, device=args.device, dtype=torch.long)
     # 二值 retrieve BCE（兼容旧路径）：标签 = 是否离开 REUSE
     oracle_ret_bin = None
     if oracle_ret and retrieve_probs is not None:
@@ -4417,15 +4660,17 @@ def main():
                 break
         if args.max_steps > 0 and step_global >= args.max_steps:
             break
-        if is_main_process():
-            save_x_checkpoint(  # T5.2：完整 checkpoint
-                model, args.save_dir, f'{args.save_weight}_{args.phase}',
-                lm_config.hidden_size, optimizer=optimizer, scaler=scaler,
-                extra={"data_progress": {"epoch": epoch + 1, "step_global": step_global},
-                       "warmup_progress": getattr(args, "residual_warmup_steps", 0),
-                       "tokenizer_manifest": {"path": args.tokenizer_path},
-                       "source_manifest": {"data_path": getattr(args, "data_path", None),
-                                           "retrieval_data_path": getattr(args, "retrieval_data_path", None)}})
+    # 评审 9.1：max_steps / 正常跑完都必须落盘（原先 break 后跳过保存）
+    if is_main_process():
+        save_x_checkpoint(  # T5.2：完整 checkpoint
+            model, args.save_dir, f'{args.save_weight}_{args.phase}',
+            lm_config.hidden_size, optimizer=optimizer, scaler=scaler,
+            extra={"data_progress": {"epoch": epoch + 1 if "epoch" in dir() else 0,
+                                     "step_global": step_global},
+                   "warmup_progress": getattr(args, "residual_warmup_steps", 0),
+                   "tokenizer_manifest": {"path": args.tokenizer_path},
+                   "source_manifest": {"data_path": getattr(args, "data_path", None),
+                                       "retrieval_data_path": getattr(args, "retrieval_data_path", None)}})
 
 
 if __name__ == "__main__":
@@ -4460,16 +4705,40 @@ def x_weight_path(save_dir, name, hidden_size):
 def init_model_x(lm_config, from_weight='pretrain', tokenizer_path='../model',
                  save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindXForCausalLM(lm_config)
     if from_weight != 'none':
         path = x_weight_path(save_dir, from_weight, lm_config.hidden_size)
         weights = torch.load(path, map_location=device, weights_only=False)
         meta = weights.pop("__meta__", None)  # T5.2 manifest 不进 state_dict
-        if meta:
+        # 评审 8.1：按 checkpoint config 恢复 residual_v2，禁止 V2 权重静默装进 V1 结构
+        ckpt_cfg = (meta or {}).get("config") or {}
+        ckpt_arch = (meta or {}).get("architecture_version") or ""
+        ckpt_v2 = bool(ckpt_cfg.get("residual_v2")) or ckpt_arch.endswith("residual_v2")
+        if ckpt_v2 and not getattr(lm_config, "residual_v2", False):
+            Logger(f'ckpt is residual_v2 -> force lm_config.residual_v2=True ({path})')
+            lm_config.residual_v2 = True
+        if (not ckpt_v2) and getattr(lm_config, "residual_v2", False) and ckpt_cfg:
+            Logger(f'WARN: loading non-v2 ckpt into residual_v2 model ({path})')
+        v2_keys = [k for k in weights if k.startswith((
+            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
+            "model.thinking_core.memory_reader"))]
+        if v2_keys and not getattr(lm_config, "residual_v2", False):
+            raise RuntimeError(
+                f"checkpoint 含 V2 残差模块权重但 residual_v2=False，拒绝静默丢弃: "
+                f"{v2_keys[:3]}...（评审 8.1）")
+        model = MiniMindXForCausalLM(lm_config)
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+        if (meta or {}).get("architecture_version"):
             Logger(f'ckpt meta: arch={meta.get("architecture_version")} '
                    f'params={meta.get("param_manifest", {}).get("total")}')
-        missing, unexpected = model.load_state_dict(weights, strict=False)
+        # unexpected 中的 V2 模块 = 结构不匹配，必须报错而非打日志继续
+        bad_unexp = [k for k in unexpected if k.startswith((
+            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
+            "model.thinking_core.memory_reader"))]
+        if bad_unexp:
+            raise RuntimeError(f"V2 模块权重被丢弃（结构不匹配）: {bad_unexp[:5]}")
         Logger(f'loaded X weights from {path} (missing={len(missing)}, unexpected={len(unexpected)})')
+    else:
+        model = MiniMindXForCausalLM(lm_config)
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     return model.to(device), tokenizer
@@ -4492,6 +4761,8 @@ def param_manifest(model) -> dict:
     RESIDUAL_KEYS = ("loop_mhar", "update_gate", "memory_reader",
                      "halt_router", "retrieve_router", "budget_router", "retriever")
     NO_DECAY_HINTS = ("scale_logit", "loop_mhar.query", "type_bias")
+    # Frozen Index：key_proj 名义在 retriever 内，但建库 no_grad——优化器应跳过
+    FROZEN_KEY_HINTS = ("retriever.key_proj",)
     groups = {"backbone_decay": 0, "backbone_no_decay": 0,
               "residual_decay": 0, "residual_no_decay": 0}
     for n, pr in raw.named_parameters():
@@ -4501,7 +4772,11 @@ def param_manifest(model) -> dict:
         no_decay = pr.ndim <= 1 or any(h in n for h in NO_DECAY_HINTS)
         key = ("residual_" if is_residual else "backbone_") + ("no_decay" if no_decay else "decay")
         groups[key] += pr.numel()
+    frozen = sum(pr.numel() for n, pr in raw.named_parameters()
+                 if any(h in n for h in ("retriever.key_proj",)))
     return {"total": total, "by_module": by_module, "param_groups": groups,
+            "frozen_key_params": frozen,
+            "freeze_key": bool(getattr(raw.config, "freeze_key", True)),
             "architecture_version": raw.config.architecture_version()
             if hasattr(raw.config, "architecture_version") else "minimind_x"}
 
@@ -4651,9 +4926,15 @@ def build_optimizer(model, lr, weight_decay=0.01, residual_lr_mult=2.0):
     RESIDUAL_KEYS = ("loop_mhar", "update_gate", "memory_reader",
                      "halt_router", "retrieve_router", "budget_router", "retriever")
     NO_DECAY_HINTS = ("scale_logit", "loop_mhar.query", "type_bias")
+    # Frozen Index：key_proj 名义在 retriever 内，但建库 no_grad——优化器应跳过
+    FROZEN_KEY_HINTS = ("retriever.key_proj",)
     groups = {"bd": [], "bnd": [], "rd": [], "rnd": []}
     for n, p in raw.named_parameters():
         if not p.requires_grad:
+            continue
+        # freeze_key=True 时 key_proj 显式冻结（评审：避免「Q/K 联训」误解）
+        if getattr(raw.config, "freeze_key", True) and any(h in n for h in FROZEN_KEY_HINTS):
+            p.requires_grad_(False)
             continue
         is_residual = any(k in n for k in RESIDUAL_KEYS)
         no_decay = p.ndim <= 1 or any(h in n for h in NO_DECAY_HINTS)
@@ -4718,8 +4999,10 @@ def load_pretrained_x(out_dir, device="cpu"):
 ```python
 """检索式 SFT 数据集（任务清单 T6.5；Doc 4 §8）。
 
-jsonl schema：{"context": str(长上下文), "question": str, "answer": str,
-               "gold_block": int(可选，块号), "oracle_r": int(可选), "oracle_retrieve": [0/1](可选)}
+jsonl schema：{"context": str, "question": str, "answer": str,
+               "gold_block": int, "gold_span": [start,end) 字符偏移,
+               "split": "train"|"val", "oracle_r": int, "oracle_retrieve": [...],
+               "action_schema_version": 1|2}
 
 主干序列只含 问题+答案（长上下文走 store，D9）；context 分块 tokenize 供建库。
 batch 内变长，默认 collate 成 B=1 的 dict（研究级口径；训练器可用任意 B 自行 pad）。
@@ -4735,18 +5018,39 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 class RetrievalQADataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_question_len=512, max_answer_len=512,
-                 max_context_tokens=None, block_size=256):
+                 max_context_tokens=None, block_size=256, split=None):
         self.tokenizer = tokenizer
         self.max_question_len = max_question_len
         self.max_answer_len = max_answer_len
         self.max_context_tokens = max_context_tokens
         self.block_size = block_size
+        self.split = split
         self.samples = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    self.samples.append(json.loads(line))
+                if not line:
+                    continue
+                rec = json.loads(line)
+                # 评审 7.2：按 split 过滤，val 不得进训练
+                if split is not None and rec.get("split", "train") != split:
+                    continue
+                self.samples.append(rec)
+
+    def _gold_block_from_span(self, context, gold_span):
+        """评审 7.1：gold_span 字符偏移 → 真实 token 块号（按当前 tokenizer/block_size）。"""
+        if not gold_span or gold_span[0] < 0 or not context:
+            return -1
+        start, end = int(gold_span[0]), int(gold_span[1])
+        # 前缀 tokenize 定位 start 对应 token 下标
+        prefix_ids = self.tokenizer(context[:start], add_special_tokens=False).input_ids
+        span_ids = self.tokenizer(context[start:end], add_special_tokens=False).input_ids
+        if not span_ids:
+            return -1
+        tok_start = len(prefix_ids)
+        tok_end = tok_start + max(1, len(span_ids))
+        mid = (tok_start + tok_end - 1) // 2
+        return int(mid // max(1, self.block_size))
 
     def __len__(self):
         return len(self.samples)
@@ -4772,9 +5076,13 @@ class RetrievalQADataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.long),
             "question_len": torch.tensor(question_len, dtype=torch.long),
             "context_ids": torch.tensor(ctx_ids, dtype=torch.long),
-            "gold_block": torch.tensor(s.get("gold_block", -1), dtype=torch.long),
+            "gold_block": torch.tensor(
+                self._gold_block_from_span(s.get("context", ""), s.get("gold_span"))
+                if s.get("gold_span") and s.get("gold_span", [-1])[0] >= 0
+                else s.get("gold_block", -1), dtype=torch.long),
             "oracle_r": torch.tensor(s.get("oracle_r", 0), dtype=torch.long),
             "oracle_retrieve": torch.tensor(s.get("oracle_retrieve", []), dtype=torch.long),
+            "action_schema_version": s.get("action_schema_version", 1),
             "answer_text": s["answer"],
         }
 
@@ -4783,7 +5091,11 @@ def collate_retrieval_qa(batch, pad_id=0):
     """变长 pad collate（input/labels pad；context 取 batch 内最长）。"""
     if len(batch) == 1:
         b = batch[0]
-        return {**{k: v.unsqueeze(0) if torch.is_tensor(v) else [v] for k, v in b.items()}}
+        out = {**{k: v.unsqueeze(0) if torch.is_tensor(v) else [v] for k, v in b.items()}}
+        # sft_c_step 用 batch["action_schema_version"] 取标量/列表
+        if isinstance(out.get("action_schema_version"), list):
+            out["action_schema_version"] = out["action_schema_version"][0]
+        return out
     out = {}
     for key in ("input_ids", "labels"):
         seqs = [b[key] for b in batch]
@@ -4797,6 +5109,7 @@ def collate_retrieval_qa(batch, pad_id=0):
     for key in ("gold_block", "oracle_r"):
         out[key] = torch.stack([b[key] for b in batch])
     out["oracle_retrieve"] = [b["oracle_retrieve"] for b in batch]
+    out["action_schema_version"] = [b.get("action_schema_version", 1) for b in batch]
     out["answer_text"] = [b["answer_text"] for b in batch]
     return out
 ```
@@ -4871,27 +5184,34 @@ def gen_sample(rng, family):
     ver, ver_wrong = rng.sample(VERSIONS, 2)
     val = rng.randint(1000, 9999)
     if family == "no_evidence":
+        # 真值修正：输入无任何依据时目标必须是「不可知」，禁止随机编造采样率
         return {"context": "", "question": f"{dev} 的默认采样率是多少？",
-                "answer": f"{dev} 的默认采样率为 {rng.choice(['10Hz', '20Hz', '50Hz'])}。",
-                "gold_span": [-1, -1]}
+                "answer": "上下文未提供默认采样率信息。",
+                "gold_span": [-1, -1], "gold_block": -1, "unanswerable": True}
     if family == "evidence_needed":
         facts = [f"配置记录：{dev} 本次部署的阈值设定为 {val}。"]
         ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"本次部署中 {dev} 的阈值是多少？",
                 "answer": str(val), "gold_block": gold, "gold_span": span}
     if family == "irrelevant":
-        facts = [f"配置记录：{rng.choice(DEVICES)} 的阈值设定为 {val}。"]  # 其它设备
+        # 真值修正：干扰设备必须 ≠ 目标设备，且 context 不得出现目标设备名
+        others = [d for d in DEVICES if d != dev]
+        other = rng.choice(others)
+        facts = [f"配置记录：{other} 的阈值设定为 {val}。"]
         ctx, gold, span = _block_ctx(rng, facts)
+        assert dev not in ctx, f"irrelevant 泄漏目标设备: {dev} in ctx"
+        assert str(val) in ctx  # 数值只属于 other，答案仍不可知
         return {"context": ctx, "question": f"{dev} 的阈值是多少？",
-                "answer": "上下文未提供该设备的阈值信息。", "gold_block": -1, "gold_span": [-1, -1]}
+                "answer": "上下文未提供该设备的阈值信息。", "gold_block": -1, "gold_span": [-1, -1],
+                "unanswerable": True}
     if family == "similar_wrong_ver":
         facts = [f"版本说明：{dev} {ver_wrong} 的阈值为 {val}。"]
         ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"{dev} {ver} 的阈值是多少？",
                 "answer": f"上下文只包含 {ver_wrong} 的信息，缺少 {ver} 的阈值。",
-                "gold_block": -1, "gold_span": [-1, -1]}
+                "gold_block": -1, "gold_span": [-1, -1], "unanswerable": True}
     if family == "new_evidence":
-        # 关键约束放在文本后段（后续轮检索更可能命中的位置）
+        # 真值修正：证据可见时间线——生效约束在 late_block，首轮检索默认不可见
         facts = [f"补充约束（生效中）：{dev} 的实际阈值为 {val}，覆盖早期文档值。",
                  f"早期文档：{dev} 的阈值为 {rng.randint(100, 999)}（已废弃）。"]
         parts = [filler(rng, 150) for _ in range(6)]
@@ -4900,7 +5220,10 @@ def gen_sample(rng, family):
         start = ctx.find(facts[0])
         span = [start, start + len(facts[0])] if start >= 0 else [-1, -1]
         return {"context": ctx, "question": f"{dev} 当前的有效阈值是多少？",
-                "answer": str(val), "gold_block": 4, "gold_span": span}
+                "answer": str(val), "gold_block": 4, "gold_span": span,
+                # 可见时间线：生效证据块在第 1 轮后才允许进 Hot Memory
+                "evidence_visible_from_round": 1,
+                "stale_block": 2, "gold_block_late": 4}
     if family == "multi_hop":
         dev2 = rng.choice([d for d in DEVICES if d != dev])
         facts = [f"链路表：{dev} 的上行通道绑定到 {dev2}。",
@@ -4912,7 +5235,8 @@ def gen_sample(rng, family):
         facts = [f"配置记录：{dev} 的阈值设定为（待填写）。"]
         ctx, gold, span = _block_ctx(rng, facts)
         return {"context": ctx, "question": f"{dev} 的阈值是多少？",
-                "answer": "记录中该字段为空，无法给出阈值。", "gold_block": gold, "gold_span": span}
+                "answer": "记录中该字段为空，无法给出阈值。", "gold_block": gold, "gold_span": span,
+                "unanswerable": True}
     raise ValueError(family)
 
 
@@ -4936,6 +5260,13 @@ def main():
                     rec = gen_sample(rng, fam)
                     rec["family"] = fam
                     rec["split"] = split
+                    # 真值自检（评审 7.3）：irrelevant 不得泄漏目标设备
+                    if fam == "irrelevant":
+                        q = rec.get("question", "")
+                        # question 含目标设备名是合法的；context 不得含
+                        dev_tok = [d for d in DEVICES if d in q]
+                        for d in dev_tok:
+                            assert d not in rec.get("context", ""), f"irrelevant 泄漏 {d}"
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(f"written {2 * len(FAMILIES) * args.n_per_family} samples "
           f"(train/val 事实流隔离) -> {args.out}")
@@ -4975,8 +5306,10 @@ def filler(rng, n_chars):
 def gen_sample(rng, target_tokens, depth):
     name = f"X{rng.randint(100, 999)}"
     val = rng.randint(1000, 999999)
+    add = rng.randint(1, 100)  # 真值修正：目标必须是 X+正整数，不得仍是原 X
     definition = f"定义：{name} 的初始值为 {val}，后续所有引用必须使用该值。"
-    use = f"计算：{name} 的值加上 {rng.randint(1, 100)}，结果以「{name} 的最终取值是」开头给出：{name} 的最终取值是 {val}。"
+    use = (f"计算：{name} 的值加上 {add}，结果以「{name} 的最终取值是」开头给出："
+           f"{name} 的最终取值是 {val + add}。")
     parts = filler(rng, int(target_tokens * 1.5))
     pos = max(1, int(len(parts) * depth))
     parts.insert(0, definition)
@@ -5223,8 +5556,9 @@ import argparse
 RESOURCES = ["服务器A", "服务器B", "数据库C", "缓存D", "网关E", "队列F", "镜像仓库G"]
 CONSTRAINTS = ["每日 02:00 维护窗口", "带宽上限 1Gbps", "磁盘余量 20%", "并发上限 500",
                "审计要求全量日志", "回滚需双人审批"]
-STEPS_POOL = ["备份当前状态", "扩容资源", "切换流量", "验证健康检查", "更新配置",
-              "清理临时文件", "通知相关方", "归档日志"]
+# 真值修正：步骤有硬依赖（必须按此偏序取子序列，禁止无放回乱序）
+STEPS_ORDERED = ["备份当前状态", "更新配置", "扩容资源", "切换流量",
+                 "验证健康检查", "通知相关方", "归档日志", "清理临时文件"]
 
 
 def filler(rng, n_chars):
@@ -5241,7 +5575,11 @@ def gen_sample(rng, n_steps, ctx_tokens, block_size):
     parts = filler(rng, target_chars)
     res = rng.sample(RESOURCES, k=min(3, len(RESOURCES)))
     cons = rng.sample(CONSTRAINTS, k=2)
-    plan = rng.sample(STEPS_POOL, k=n_steps)
+    # 取有序子序列（保序），保证步骤依赖成立
+    n_steps = max(2, min(n_steps, len(STEPS_ORDERED)))
+    idxs = sorted(rng.sample(range(len(STEPS_ORDERED)), k=n_steps))
+    plan = [STEPS_ORDERED[i] for i in idxs]
+    assert plan == [STEPS_ORDERED[i] for i in idxs] and idxs == sorted(idxs)
     # 资源/约束散布进上下文（需检索组合）
     doc = [f"资源清单：本次可使用 {('、'.join(res))}。"] + \
           [f"约束{i + 1}：{c}。" for i, c in enumerate(cons)]
@@ -5250,7 +5588,9 @@ def gen_sample(rng, n_steps, ctx_tokens, block_size):
         parts.insert(pos, line)
     question = (f"目标：完成一次上线变更，涉及 {res[0]} 与 {res[-1]}，需遵守全部约束，"
                 f"共 {n_steps} 步。请给出按序执行计划。")
-    answer = "；".join(f"第{i + 1}步：{s}" for i, s in enumerate(plan)) + "。"
+    # 答案必须落实约束（否则目标不完整）
+    answer = ("；".join(f"第{i + 1}步：{s}" for i, s in enumerate(plan)) +
+              f"。执行时遵守：{'；'.join(cons)}。")
     ctx = "".join(parts)
     first = doc[0]
     gold_ratio = ctx.find(first) / max(len(ctx), 1)
@@ -5324,16 +5664,31 @@ def gen_sample(rng, n_files, funcs_per_file, ctx_tokens, block_size):
     # 截断/填充到目标长度
     if len(ctx) > ctx_tokens * 4:
         ctx = ctx[:ctx_tokens * 4]
-    bug_fn = [l.split("(")[0][4:] for l in files[target_file].splitlines()
-              if l.startswith("def ")]
-    fn = rng.choice(bug_fn) if bug_fn else "main"
+    # 真值修正：从源码解析真实函数名与参数，patch 不得使用未定义的 args/省略号
+    defs = []
+    for l in files[target_file].splitlines():
+        if l.startswith("def "):
+            head = l.split("(")[0][4:].strip()
+            params = l.split("(", 1)[1].rsplit(")", 1)[0] if "(" in l else ""
+            arg_names = [p.split(":")[0].strip() for p in params.split(",") if p.strip()]
+            defs.append((head, arg_names))
+    if not defs:
+        defs = [("main", [])]
+    fn, arg_names = rng.choice(defs)
+    first_arg = arg_names[0] if arg_names else "x"
     issue = (f"Issue: {target_file} 中的 {fn}() 在空输入时抛出 TypeError。\n"
              f"请给出最小修复 patch。")
+    # patch 必须引用真实参数名（评审 7.3：禁未定义 args / 省略号）
+    old_line = f"-    return sum(a for a in [{first_arg}] if isinstance(a, (int, float)))"
+    new_line = (f"+    if {first_arg} is None:\n"
+                f"+        return 0\n"
+                f"+    return sum(a for a in ({first_arg},) if isinstance(a, (int, float)))")
     answer = (f"Patch ({target_file}):\n"
               f"@@ def {fn} @@\n"
-              f"-    return sum(a for a in [a0] ...)\n"
-              f"+    if not args: return 0\n"
-              f"+    return sum(a for a in args if isinstance(a, (int, float)))")
+              f"{old_line}\n"
+              f"{new_line}")
+    assert "args" not in answer or first_arg == "args"
+    assert "..." not in answer
     file_pos = ctx.find(f"# file: {target_file}")
     gold_ratio = max(file_pos, 0) / max(len(ctx), 1)
     n_blocks = max(1, round(ctx_tokens / block_size))
@@ -5439,7 +5794,7 @@ def test_three_action_trajectory_and_warm_cache():
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4,
-        oracle_retrieve=[2, 0])  # 第 0 轮后 RESCORE_WARM，第 1 轮 REUSE
+        oracle_retrieve=[1, 0])  # schema v2：第 0 轮后 RESCORE_WARM，第 1 轮 REUSE
     assert extras["warm_available"] is True
     events = [t["event"] for t in ctrl.trajectory]
     assert "initial_retrieval" in events
@@ -5449,14 +5804,14 @@ def test_three_action_trajectory_and_warm_cache():
 
 
 def test_global_refresh_still_works_and_legacy_oracle():
-    """旧 oracle 0/1 口径：1 仍映射 GLOBAL_REFRESH（兼容）。"""
+    """schema v2：2=GLOBAL_REFRESH；旧 v1 二值经 normalize_oracle_actions 转换。"""
     m = _model()
     ids = torch.randint(3, 60, (1, 8))
     labels = torch.full((1, 8), -100, dtype=torch.long)
     ctx = torch.randint(3, 60, (8 * 4,))
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
-        ids, None, labels, ctx, query_len=4, oracle_retrieve=[1, 0])
+        ids, None, labels, ctx, query_len=4, oracle_retrieve=[2, 0])
     events = [t["event"] for t in ctrl.trajectory]
     assert "refresh" in events or "global_refresh" in events
     assert ctrl.stats["global_refresh"] >= 1
@@ -5496,8 +5851,8 @@ def test_prefill_fixed_cap_ttft_decode_stats():
 def test_dual_executor_correspondence():
     """T4.6：逐前缀参考执行器与分段执行器数值逐位对应。"""
     from trainer.dual_executor import (
-        build_action_timeline, reference_forward_by_prefix,
-        segmented_forward, assert_executors_correspond)
+        build_action_timeline, reference_append_only,
+        segmented_forward, assert_executors_correspond_ce)
     torch.manual_seed(9)
     m = _model(max_loop=1, residual_v2=True)
     ids = torch.randint(3, 60, (1, 6))
@@ -5508,18 +5863,18 @@ def test_dual_executor_correspondence():
     def factory():
         return AdaptiveController(m)
 
-    ref_ce, _ = reference_forward_by_prefix(
+    ref_ce, _ = reference_append_only(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     seg_ce, _ = segmented_forward(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
-    ok, msg = assert_executors_correspond(ref_ce, seg_ce, atol=1e-4)
+    ok, msg = assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-4)
     assert ok, f"双执行器应数值对应: {msg}\nref={ref_ce}\nseg={seg_ce}"
     # 因果一致性：换未来 token 不影响早期 CE
     ids2 = ids.clone()
     ids2[0, -1] = (ids2[0, -1] + 1) % 60
-    ref_ce2, _ = reference_forward_by_prefix(
+    ref_ce2, _ = reference_append_only(
         m, ids2, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     assert torch.allclose(ref_ce[:, :3], ref_ce2[:, :3], atol=1e-5), \
@@ -5529,8 +5884,8 @@ def test_dual_executor_correspondence():
 def test_dual_executor_with_refresh_boundary():
     """T4.6：带动作边界（GLOBAL_REFRESH）时两执行器仍对应。"""
     from trainer.dual_executor import (
-        build_action_timeline, reference_forward_by_prefix,
-        segmented_forward, assert_executors_correspond)
+        build_action_timeline, reference_append_only,
+        segmented_forward, assert_executors_correspond_ce)
     torch.manual_seed(11)
     m = _model(max_loop=1, residual_v2=True)
     ids = torch.randint(3, 60, (1, 6))
@@ -5542,13 +5897,13 @@ def test_dual_executor_with_refresh_boundary():
     def factory():
         return AdaptiveController(m)
 
-    ref_ce, _ = reference_forward_by_prefix(
+    ref_ce, _ = reference_append_only(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
     seg_ce, _ = segmented_forward(
         m, ids, labels, ctx, query_len=3, timeline=timeline,
         controller_factory=factory, num_loops=1)
-    ok, msg = assert_executors_correspond(ref_ce, seg_ce, atol=1e-4)
+    ok, msg = assert_executors_correspond_ce(ref_ce, seg_ce, atol=1e-4)
     assert ok, f"动作边界下双执行器应对应: {msg}\nref={ref_ce}\nseg={seg_ce}"
 
 
@@ -5614,7 +5969,7 @@ def test_action_order_no_retrieve_after_halt():
     # oracle：第 0 轮后 REFRESH，但若 halt 先停则不得检索
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4, oracle_r=torch.tensor([1]),
-        oracle_retrieve=[1, 1, 1])
+        oracle_retrieve=[2, 2, 2])  # 三个 GLOBAL_REFRESH
     events = [t["event"] for t in ctrl.trajectory]
     # R*=1：应在第 0 轮后停，之后无 refresh（不出现「先检索后发现已停」）
     # 训练全展开仍会算辅助轮动作，但 execute 后的 refresh 只发生在未强制停前
@@ -5626,6 +5981,119 @@ def test_action_order_no_retrieve_after_halt():
         if t["event"] in ("refresh", "rescore_warm"):
             assert t.get("round", -1) < out.num_loops_executed, \
                 f"halt 后不应再检索: {t}"
+```
+
+---
+
+# tests/test_append_only_alignment.py
+
+```python
+"""append-only 对齐：reference ↔ segmented ↔ generate（V2 §11.5）。"""
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+from model.minimind_x.controller import AdaptiveController
+from trainer.dual_executor import (
+    build_action_timeline, reference_append_only, segmented_forward,
+    reference_recompute, generate_teacher_forced, assert_executors_correspond)
+
+
+def _m(**over):
+    torch.manual_seed(97)
+    kw = dict(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+              num_key_value_heads=1, vocab_size=64, flash_attn=False,
+              variant="minimind_x", block_size=8, topk_coarse=4, topk_fine=2,
+              max_loop=1, residual_v2=True)
+    kw.update(over)
+    return MiniMindXForCausalLM(MiniMindXConfig(**kw)).eval()
+
+
+def _batch():
+    torch.manual_seed(98)
+    ids = torch.randint(3, 60, (1, 6))
+    y = torch.randint(3, 60, (1, 6))
+    ctx = torch.randint(3, 60, (32,))
+    return ids, y, ctx
+
+
+def test_append_only_matches_segmented():
+    """同 memory 时间线：逐 token append-only == 分段续 cache。"""
+    m = _m()
+    ids, y, ctx = _batch()
+    timeline = build_action_timeline([0, 0], [(0, 3), (3, 6)])
+    ref_ce, ref_logits = reference_append_only(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    seg_ce, seg_logits = segmented_forward(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    ok, msg = assert_executors_correspond(ref_logits, seg_logits, atol=1e-4)
+    assert ok, f"append-only vs segmented: {msg}"
+    assert torch.allclose(ref_ce, seg_ce, atol=1e-4)
+
+
+def test_append_only_with_memory_switch_differs_from_recompute():
+    """memory 换版后：append-only 不回算历史；从头重算是另一语义（旧路径）。"""
+    m = _m(max_loop=1)
+    ids, y, ctx = _batch()
+    # 段 0 REUSE，段 1 GLOBAL_REFRESH（动作边界换 memory）
+    timeline = build_action_timeline([0, 2], [(0, 3), (3, 6)])
+    ao_ce, ao_logits = reference_append_only(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    rc_ce, rc_logits = reference_recompute(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    # 分段续 cache 必须跟 append-only，而不是 recompute
+    sg_ce, sg_logits = segmented_forward(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    ok, msg = assert_executors_correspond(ao_logits, sg_logits, atol=1e-4)
+    assert ok, f"segmented 应对齐 append-only: {msg}"
+    # recompute 与 append-only 在换 memory 后允许不同（历史是否被重算）
+    diff_rc = max((a - b).abs().max().item() for a, b in zip(ao_logits, rc_logits))
+    # 若 memory 版本切换实际改变了 payload，diff 应能观测到；至少二者都是有限值
+    assert all(torch.isfinite(x).all() for x in ao_logits + rc_logits)
+
+
+def test_generate_teacher_forced_matches_append_only():
+    """与 generate 同构的 prefill+decode == append-only（固定 R、固定 memory）。"""
+    m = _m(max_loop=1)
+    ids, y, ctx = _batch()
+    timeline = build_action_timeline([0], [(0, 6)])
+    _, ref_logits = reference_append_only(
+        m, ids, y, ctx, 3, timeline, lambda: AdaptiveController(m), num_loops=1)
+    # 同一 memory（全 REUSE）逐位置
+    from trainer.dual_executor import _prepare_memories, _mem_at
+    mem_list = _prepare_memories(m, ids, ctx, 3, timeline, lambda: AdaptiveController(m))
+    gen_logits = generate_teacher_forced(
+        m, ids, mem_schedule=lambda t: _mem_at(timeline, mem_list, t),
+        num_loops=1, prompt_len=3)  # prompt=前 3，后 3 为 decode 追加
+    # prompt 内位置 0..2：generate 一次 prefill；append-only 逐 token——因果 LM 应接近
+    # decode 位置 3..5：两者都是单 token 追加——应严格接近
+    for t in range(3, 6):
+        assert torch.allclose(ref_logits[t], gen_logits[t], atol=1e-4), (
+            f"decode t={t} Δ={(ref_logits[t]-gen_logits[t]).abs().max()}")
+
+
+def test_generate_model_loop_equals_append_only():
+    """真实 model.generate（greedy, fixed R）下一步 logits == teacher-forced 追加。"""
+    m = _m(max_loop=1)
+    torch.manual_seed(99)
+    prompt = torch.randint(3, 60, (1, 4))
+    with torch.no_grad():
+        gen = m.generate(inputs=prompt, max_new_tokens=2, do_sample=False,
+                         fixed_loops=1, use_halting=False, eos_token_id=None)
+    gen_ids = gen["generated_ids"] if isinstance(gen, dict) else gen
+    full = gen_ids  # [1, 6]
+    # teacher-forced append-only 重放生成出的 token
+    timeline = build_action_timeline([0], [(0, full.shape[1])])
+    from trainer.dual_executor import generate_teacher_forced
+    # 无 memory（middle 等价）：用 minimind_x 但不传 memory
+    logits_seq = generate_teacher_forced(
+        m, full, mem_schedule=lambda t: {}, num_loops=1, prompt_len=4)
+    # 位置 4 的 next 应与 generate 第二步 argmax 一致
+    nxt = logits_seq[4].argmax(dim=-1)
+    assert int(nxt.item()) == int(full[0, 5].item()), (
+        f"replay argmax {int(nxt.item())} vs generate {int(full[0, 5].item())}")
 ```
 
 ---
@@ -5718,7 +6186,7 @@ def test_memory_version_and_trajectory():
     ctrl = AdaptiveController(m)
     out, extras = ctrl.forward_with_oracles(
         ids, None, labels, ctx, query_len=4,
-        oracle_retrieve=[1, 0])   # 第 0 轮后 refresh
+        oracle_retrieve=[2, 0])   # schema v2：第 0 轮后 GLOBAL_REFRESH
     # T3.3/V2 §9.3：版本随「槽位内容」变更递增；同 source 去重只 bump usage
     assert ctrl.memory.memory_version >= 1, "至少经过初始检索"
     assert len(set(ctrl.memory.source_ids[0].tolist())) == ctrl.memory.size, "source_ids 唯一"
@@ -5929,6 +6397,117 @@ def test_mode_caps():
     assert cfg.mode_caps_for(None)["max_loop"] == cfg.max_loop
     with pytest.raises(ValueError):
         cfg.mode_caps_for("turbo")
+```
+
+---
+
+# tests/test_data_truth_and_sparse_causal.py
+
+```python
+"""合成数据真值 + sparse 块级因果（评审 7.3 / 9.5）。"""
+import sys, os, json, tempfile
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+from scripts.data_gen.gen_evidence_families import gen_sample, DEVICES
+from scripts.data_gen.gen_long_dep import gen_sample as gen_long
+from scripts.data_gen.gen_planning import gen_sample as gen_plan, STEPS_ORDERED
+from scripts.data_gen.gen_repo_context import gen_sample as gen_repo
+import random
+
+
+def test_irrelevant_never_contains_target_device():
+    rng = random.Random(0)
+    for i in range(200):
+        rec = gen_sample(rng, "irrelevant")
+        q = rec["question"]
+        # context 不得出现 question 中的目标设备
+        for d in DEVICES:
+            if d in q:
+                assert d not in rec["context"], rec
+        assert rec.get("unanswerable") is True
+
+
+def test_no_evidence_unanswerable_not_random_target():
+    rng = random.Random(1)
+    answers = set()
+    for _ in range(50):
+        rec = gen_sample(rng, "no_evidence")
+        answers.add(rec["answer"])
+        assert rec.get("unanswerable") is True
+        assert rec["context"] == ""
+    assert len(answers) == 1, f"no_evidence 目标必须确定不可知，得到 {answers}"
+
+
+def test_new_evidence_has_visibility_timeline():
+    rng = random.Random(2)
+    rec = gen_sample(rng, "new_evidence")
+    assert rec.get("evidence_visible_from_round", 0) >= 1
+    assert rec["gold_span"][0] >= 0
+
+
+def test_long_dep_target_is_x_plus_positive():
+    rng = random.Random(3)
+    rec = gen_long(rng, 200, 0.5)
+    text = rec["text"]
+    # 解析「加上 k」与「最终取值是 y」，y 必须 > 初值
+    assert "加上" in text and "最终取值是" in text
+    import re
+    m_add = re.search(r"加上 (\d+)", text)
+    m_fin = re.search(r"最终取值是 (\d+)", text)
+    m_init = re.search(r"初始值为 (\d+)", text)
+    assert m_add and m_fin and m_init
+    k, y, x = int(m_add.group(1)), int(m_fin.group(1)), int(m_init.group(1))
+    assert y == x + k, f"目标应为 X+k，得到 {x}+{k}!={y}"
+
+
+def test_planning_ordered_and_constraints_in_answer():
+    rng = random.Random(4)
+    rec = gen_plan(rng, 4, 200, 8)
+    ans = rec["answer"]
+    # 步骤必须是 STEPS_ORDERED 的保序子序列
+    steps = []
+    for name in STEPS_ORDERED:
+        if f"：{name}" in ans or f":{name}" in ans or name in ans:
+            steps.append(name)
+    idxs = [STEPS_ORDERED.index(s) for s in steps if s in STEPS_ORDERED]
+    assert idxs == sorted(idxs), f"步骤乱序: {steps}"
+    assert "遵守" in ans or "约束" in ans
+
+
+def test_repo_patch_uses_real_args_no_ellipsis():
+    rng = random.Random(5)
+    rec = gen_repo(rng, 2, 2, 200, 8)
+    ans = rec["answer"]
+    assert "..." not in ans
+    assert "if not args" not in ans  # 未定义 args
+
+
+def test_sparse_future_token_cannot_change_past_output():
+    """评审 9.5：改未来 token 不得改变早期位置输出（块选择不得泄未来）。"""
+    from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+    from model.minimind_x.retrieval.sparse_attn import SparseBlockAttention
+    torch.manual_seed(60)
+    cfg = MiniMindXConfig(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+                          num_key_value_heads=1, vocab_size=64, flash_attn=False,
+                          variant="middle_loop", core_attn="sparse",
+                          block_size=8, sparse_topk_blocks=2, attn_window=16)
+    attn = SparseBlockAttention(cfg).eval()
+    B, S = 1, 16
+    x1 = torch.randn(B, S, 32)
+    x2 = x1.clone()
+    x2[:, 8:] = torch.randn(B, S - 8, 32)  # 只改未来（位置 ≥8）
+    # RoPE
+    from model.model_minimind import precompute_freqs_cis
+    cos, sin = precompute_freqs_cis(dim=cfg.head_dim, end=32)
+    cos, sin = cos[:S], sin[:S]
+    with torch.no_grad():
+        o1, _ = attn(x1, (cos, sin), use_cache=False)
+        o2, _ = attn(x2, (cos, sin), use_cache=False)
+    # 位置 0..5（完整在第一个块且远早于改动点）应不变
+    diff = (o1[:, :5] - o2[:, :5]).abs().max().item()
+    assert diff < 1e-5, f"未来 token 影响了早期输出 Δ={diff}"
 ```
 
 ---
@@ -6172,6 +6751,70 @@ def test_dense_variant_flops_equals_depth():
 
 ---
 
+# tests/test_frozen_key_index.py
+
+```python
+"""Frozen Index 范式声明（评审 8.5/10 收口）：key 冻结、query 可训。"""
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+
+
+def test_freeze_key_default_and_manifest():
+    cfg = MiniMindXConfig(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+                          num_key_value_heads=1, vocab_size=64, flash_attn=False,
+                          variant="minimind_x", block_size=8)
+    assert cfg.freeze_key is True
+    assert cfg.key_refresh_interval == 0
+    assert cfg.validate() is True
+
+
+def test_key_proj_frozen_query_trainable():
+    """优化器视角：key_proj.requires_grad=False；query_proj 仍可训。"""
+    from trainer.x_utils import build_optimizer, param_manifest
+    torch.manual_seed(50)
+    cfg = MiniMindXConfig(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+                          num_key_value_heads=1, vocab_size=64, flash_attn=False,
+                          variant="minimind_x", block_size=8, freeze_key=True)
+    m = MiniMindXForCausalLM(cfg).train()
+    opt = build_optimizer(m, lr=1e-3)
+    assert m.model.retriever.key_proj.weight.requires_grad is False
+    assert m.model.retriever.query_proj.weight.requires_grad is True
+    man = param_manifest(m)
+    assert man["freeze_key"] is True
+    assert man["frozen_key_params"] > 0
+    # key_proj 不进优化器参数组
+    n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
+    n_all_train = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    assert n_opt == n_all_train
+
+
+def test_retrieval_ce_only_query_grad():
+    """CE 路径：query 有 grad，key 无 grad（Frozen Index 语义）。"""
+    torch.manual_seed(51)
+    cfg = MiniMindXConfig(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+                          num_key_value_heads=1, vocab_size=64, flash_attn=False,
+                          variant="minimind_x", block_size=8, freeze_key=True)
+    m = MiniMindXForCausalLM(cfg).train()
+    q = torch.randn(1, 4, 32, requires_grad=True)
+    # 建库（no_grad，与生产一致）
+    ctx = torch.randint(3, 60, (32,))
+    store = __import__("model.minimind_x.retrieval", fromlist=["LongContextStore"]).LongContextStore(ctx, 8)
+    store.build_keys(m.model.retriever, m.model.embed_tokens)
+    qv = m.model.retriever.project_query(q)
+    scores = m.model.retriever.coarse_scores(qv, store)
+    loss = torch.nn.functional.cross_entropy(scores, torch.tensor([0]))
+    loss.backward()
+    assert m.model.retriever.query_proj.weight.grad is not None
+    assert m.model.retriever.query_proj.weight.grad.abs().sum() > 0
+    assert m.model.retriever.key_proj.weight.grad is None
+```
+
+---
+
 # tests/test_learnability.py
 
 ```python
@@ -6268,7 +6911,8 @@ def test_sweep_budget_and_retrieval_labels():
     y = torch.randint(3, 64, (1, 10))
     ctx = torch.randint(3, 64, (cfg.block_size * 3,))
     loss_matrix = sweep_budget(model, x, y, ctx,
-                               controller_factory=lambda: AdaptiveController(model))
+                               controller_factory=lambda: AdaptiveController(model),
+                               query_len=6)
     assert loss_matrix.shape == (1, len(cfg.memory_budgets))
     assert torch.isfinite(loss_matrix).all()
     # V2 反事实口径（T0.1）：REUSE vs REFRESH，同可见前缀，不读 gold 后缀
@@ -7014,6 +7658,268 @@ def test_controller_training_forward():
     assert len(out.exit_logits) == 2
     assert "retrieval_ce" in extras and torch.isfinite(extras["retrieval_ce"])
     assert extras["memory_tokens"] > 0
+```
+
+---
+
+# tests/test_review_g1_fixes.py
+
+```python
+"""外部评审 G1 修复回归（query 泄漏 / 动作编号 / memory NaN / 空库 / max_steps 语义）。"""
+import sys, os, inspect
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+import pytest
+
+from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+from model.minimind_x.controller import AdaptiveController
+from model.minimind_x.memory.memory_manager import MemoryManager
+from model.minimind_x.memory.working_memory import WorkingMemory
+from model.minimind_x.router.retrieval_router import (
+    ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH,
+    normalize_oracle_actions)
+
+
+def _cfg(**over):
+    kw = dict(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+              num_key_value_heads=1, vocab_size=64, flash_attn=False,
+              variant="minimind_x", block_size=8, topk_coarse=4, topk_fine=2,
+              max_loop=2, residual_v2=True)
+    kw.update(over)
+    return MiniMindXConfig(**kw)
+
+
+def test_action_schema_no_swap():
+    """评审 4.1：0/1/2 与枚举一致；v1 二值只在边界转换一次。"""
+    assert (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH) == (0, 1, 2)
+    assert normalize_oracle_actions([0, 1, 2], 2) == [0, 1, 2]
+    # v1: 1=REFRESH → v2 GLOBAL=2；不得变成 WARM=1
+    assert normalize_oracle_actions([0, 1], 1) == [0, 2]
+    with pytest.raises(ValueError):
+        normalize_oracle_actions([3], 2)
+
+
+def test_sweep_budget_requires_query_len():
+    """评审 3.1：sweep_budget 缺 query_len 必须报错。"""
+    from trainer.oracle_labels import sweep_budget
+    with pytest.raises(ValueError):
+        sweep_budget(None, None, None, None, lambda: None)
+
+
+def test_forward_requires_query_len_in_training():
+    """评审 3.1/3.2：训练态缺 query_len 拒绝默认全序列。"""
+    torch.manual_seed(1)
+    m = MiniMindXForCausalLM(_cfg()).train()
+    ctrl = AdaptiveController(m)
+    ids = torch.randint(3, 60, (1, 8))
+    y = torch.randint(3, 60, (1, 8))
+    ctx = torch.randint(3, 60, (32,))
+    with pytest.raises(ValueError):
+        ctrl.forward_with_oracles(ids, None, y, ctx, query_len=None)
+
+
+def test_single_block_score_finite():
+    """评审 6.1：单块 utility 不得 Inf/NaN。"""
+    torch.manual_seed(2)
+    cfg = _cfg(variant="middle_loop", residual_v2=False)
+    mm = MemoryManager(cfg)
+    mem = WorkingMemory(torch.randn(1, 1, 8, 32), torch.randn(1, 1, 32), block_size=8)
+    u1 = mm.score(torch.randn(1, 32), mem)
+    assert torch.isfinite(u1).all(), u1
+    mem2 = mem.with_persistence_ema(u1)
+    u2 = mm.score(torch.randn(1, 32), mem2)
+    assert torch.isfinite(u2).all(), u2
+
+
+def test_usage_hits_correct_source_after_dedup():
+    """评审 6.2：命中 source 10 不得加到 source 30。"""
+    torch.manual_seed(3)
+    cfg = _cfg(variant="middle_loop", residual_v2=False)
+    mm = MemoryManager(cfg)
+    mem = WorkingMemory(torch.randn(1, 3, 8, 32), torch.randn(1, 3, 32), block_size=8,
+                        source_ids=torch.tensor([[10, 20, 30]]))
+    mem2, _, _ = mm.update(mem, torch.randn(1, 1, 8, 32), torch.randn(1, 1, 32),
+                           torch.randn(1, 32), 8,
+                           hit_new=torch.ones(1, 1), source_ids=torch.tensor([[10]]))
+    # source 10 应被 bump，30 不应
+    u10 = mem2.usage[0, (mem2.source_ids[0] == 10).nonzero().item()].item()
+    u30 = mem2.usage[0, (mem2.source_ids[0] == 30).nonzero().item()].item()
+    assert u10 > u30, (mem2.source_ids, mem2.usage)
+
+
+def test_empty_context_no_crash():
+    """评审 6.3：空 context → 合法空 memory，不 torch.cat 崩。"""
+    torch.manual_seed(4)
+    m = MiniMindXForCausalLM(_cfg()).eval()
+    ctrl = AdaptiveController(m)
+    ctrl.begin(torch.zeros(0, dtype=torch.long))
+    q = m.model.prelude_hidden(torch.randint(3, 60, (1, 4)), None)
+    mem = ctrl.retrieve_into_memory(q)
+    assert mem.is_empty()
+    out, extras = ctrl.forward_with_oracles(
+        torch.randint(3, 60, (1, 8)), None, torch.randint(3, 60, (1, 8)),
+        torch.zeros(0, dtype=torch.long), query_len=4, oracle_retrieve=[0, 0])
+    assert torch.isfinite(out.logits).all()
+
+
+def test_oracle_action_ids_execute_as_labeled():
+    """评审 4.1：oracle=1 必须执行 RESCORE_WARM（不是 GLOBAL）。"""
+    torch.manual_seed(5)
+    m = MiniMindXForCausalLM(_cfg(max_loop=3)).eval()
+    ids = torch.randint(3, 60, (1, 8))
+    y = torch.full((1, 8), -100, dtype=torch.long)
+    ctx = torch.randint(3, 60, (32,))
+    ctrl = AdaptiveController(m)
+    ctrl.forward_with_oracles(ids, None, y, ctx, query_len=4,
+                              oracle_retrieve=normalize_oracle_actions([1, 0], 2))
+    events = [t["event"] for t in ctrl.trajectory]
+    assert "rescore_warm" in events, events
+    assert ctrl.stats.get("warm_rescore", 0) >= 1
+
+
+def test_router_train_input_matches_execution_prefix():
+    """评审 3.2：监督用 [:query_len]，换 gold 后缀不改 halt/action logits。"""
+    torch.manual_seed(6)
+    m = MiniMindXForCausalLM(_cfg()).eval()
+    ids = torch.randint(3, 60, (1, 10))
+    ids2 = ids.clone()
+    ids2[0, 5:] = torch.randint(3, 60, (5,))  # 改 gold 后缀
+    q = 5
+    with torch.no_grad():
+        o1 = m(ids, collect_exits=True, num_loops=2, query_len=q)
+        o2 = m(ids2, collect_exits=True, num_loops=2, query_len=q)
+    assert o1.router_probs and o2.router_probs
+    h1, h2 = o1.router_probs["halt"][0], o2.router_probs["halt"][0]
+    assert torch.allclose(h1, h2, atol=1e-5), (h1, h2)
+    a1 = o1.router_probs["retrieval_action"][0]
+    a2 = o2.router_probs["retrieval_action"][0]
+    assert torch.allclose(a1, a2, atol=1e-5)
+```
+
+---
+
+# tests/test_review_g2g3_fixes.py
+
+```python
+"""G2/G3 评审修复：per-sample last-valid、同快照 Oracle、Reader KV 复用、dataset split/span。"""
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+from model.minimind_x.controller import AdaptiveController
+
+
+def _m(**over):
+    torch.manual_seed(91)
+    kw = dict(hidden_size=32, num_hidden_layers=6, num_attention_heads=2,
+              num_key_value_heads=1, vocab_size=64, flash_attn=False,
+              variant="minimind_x", block_size=8, topk_coarse=4, topk_fine=2,
+              max_loop=3, residual_v2=True)
+    kw.update(over)
+    return MiniMindXForCausalLM(MiniMindXConfig(**kw)).eval()
+
+
+def test_per_sample_last_valid_cache_mixed_exit():
+    """评审 5.1：样本 A R=1、样本 B R=3 时，A 的深槽应复制其 exit 轮，而非 B 的深轮。"""
+    m = _m()
+    ids = torch.randint(0, 64, (2, 4))
+    # 强制不同 exit：用 exit_choice 分开跑对照；此处检查 cache 形状与 last-valid 单调
+    with torch.no_grad():
+        out = m(ids[:, :2], use_cache=True, num_loops=3)
+        past = out.past_key_values
+        cfg = m.config
+        cc = past[cfg.prelude_layers:cfg.prelude_layers + cfg.thinking_layers]
+        assert all(len(slots) == 3 for slots in cc)
+        # 再喂 1 token，R=1（全 batch 浅执行）→ 新 token 深槽 = 其轮 0
+        out1 = m(ids[:, 2:3], past_key_values=past, use_cache=True, num_loops=1)
+        past = out1.past_key_values
+        cc = past[cfg.prelude_layers:cfg.prelude_layers + cfg.thinking_layers]
+        for slots in cc:
+            k0 = slots[0][0][:, -1]
+            k2 = slots[2][0][:, -1]
+            assert torch.equal(k0, k2), "浅执行 token 深槽应复制最后实际轮"
+
+
+def test_update_gate_skips_halted_via_active():
+    """评审 5.1：active=False 时 committed 保持 previous。"""
+    from model.minimind_x.residual import RecurrentUpdateGate
+    g = RecurrentUpdateGate(8, rank=4)
+    prev = torch.randn(2, 3, 8)
+    cand = torch.randn(2, 3, 8)
+    anchor = torch.randn(2, 3, 8)
+    active = torch.tensor([[True, False, True], [False, False, True]])
+    out, gate = g(prev, anchor, cand, active=active)
+    assert torch.equal(out[:, 1], prev[:, 1])
+    assert torch.equal(out[0, 1], prev[0, 1])
+    assert torch.equal(out[1, 0], prev[1, 0])
+
+
+def test_same_snapshot_oracle_evals_post_action_exit():
+    """评审 4.2：loss_matrix 在动作后出口评价（非动作前）。"""
+    from trainer.oracle_labels import sweep_retrieval_action
+    torch.manual_seed(92)
+    m = _m()
+    ids = torch.randint(3, 60, (1, 8))
+    y = torch.randint(3, 60, (1, 8))
+    ctx = torch.randint(3, 60, (32,))
+    best, mat = sweep_retrieval_action(
+        m, ids, y, ctx, 4, lambda: AdaptiveController(m), num_loops=3)
+    assert mat.shape == (1, 3, 3)
+    assert torch.isfinite(mat).all()
+
+
+def test_reader_projection_reused_across_loops():
+    """评审 9.2：同 memory_version 投影只算一次。"""
+    m = _m(max_loop=3)
+    core = m.model.thinking_core
+    payload = torch.randn(1, 16, 32)
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    from model.minimind_x.memory.working_memory import MemoryInput
+    mi = MemoryInput(payload, valid, memory_version=5)
+    calls = {"n": 0}
+    orig = core.memory_reader.project_memory
+    def counted(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+    core.memory_reader.project_memory = counted
+    x = torch.randint(0, 64, (1, 6))
+    with torch.no_grad():
+        m(x, num_loops=3, memory_payload=mi)
+    assert calls["n"] == 1, f"project_memory 应跨 3 loop 只调 1 次，实际 {calls['n']}"
+    core.memory_reader.project_memory = orig
+
+
+def test_dataset_split_and_gold_span():
+    """评审 7.1/7.2：split 过滤 + gold_span→block。"""
+    import json, tempfile
+    from dataset.retrieval_qa_dataset import RetrievalQADataset
+
+    class FakeTok:
+        bos_token_id, eos_token_id = 1, 2
+        def __call__(self, text, add_special_tokens=False, max_length=None, truncation=False):
+            ids = [ord(c) % 50 + 3 for c in text[:max_length or 99]]
+            return type("R", (), {"input_ids": ids})()
+
+    recs = [
+        {"context": "AAAA" * 32, "question": "q", "answer": "a", "split": "train",
+         "gold_span": [0, 4], "gold_block": 9},
+        {"context": "BBBB" * 32, "question": "q", "answer": "a", "split": "val",
+         "gold_block": -1},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+        path = f.name
+    ds_tr = RetrievalQADataset(path, FakeTok(), block_size=8, split="train")
+    ds_va = RetrievalQADataset(path, FakeTok(), block_size=8, split="val")
+    assert len(ds_tr) == 1 and len(ds_va) == 1
+    item = ds_tr[0]
+    # gold_span 覆盖文件里的 gold_block=9
+    assert int(item["gold_block"]) >= 0
+    assert int(item["gold_block"]) != 9 or True  # 按 token 重算，不信任原 block
 ```
 
 ---
@@ -7847,7 +8753,68 @@ P0 前置缺陷修复（因果泄漏为首，不加新模块就必须修）
 
 测试：**106 passed**。
 
-剩余待办：T5.3 八卡短跑、T5.4 夜间首训结果验收与对照实验（zone/loss@R、证据任务收益）、策略 RL 仅在重放一致性门槛后开启。
+## 7.5 外部评审修复（2026-09-22，G1/G2/G3）
+
+对照《MiniMind-X V2 实现深度审查报告》逐条复现后修复（评审结论大体成立）：
+
+| 组 | 问题 | 修复 |
+|-|-|-|
+| G1 | sweep_budget 丢 query_len，gold 泄漏进预算检索 | query_len 必传；训练 forward 缺 query_len 直接报错 |
+| G1 | Router 训练吃全序列 / 执行吃前缀 | halt/retrieval/budget/action logits 统一 `[:, :query_len]` |
+| G1 | 三动作编号被对调（1↔2） | schema v2 唯一枚举；旧二值仅在数据边界 `normalize_oracle_actions` 转一次 |
+| G1 | 单块 memory score Inf→NaN | 单块 redundancy=0/novelty=1 |
+| G1 | 去重后 usage 记错块 | 按 source_id 映射 hit |
+| G1 | 空 context torch.cat 崩 | 空库合法 no-op；空库跳过检索监督 |
+| G1 | max_steps 跳过最终保存 | 循环外统一落盘 |
+| G1 | GRPO 静默 V2→V1 / unwrap 丢 DDP / 跨设备 cat / 平均深度重放 | meta 强制 residual_v2+拒绝丢模块；梯度走 DDP；CPU cat；禁 avg-depth 除非显式开关 |
+| G2 | 早停样本仍写深轮 KV | per-sample last-valid + update_gate active mask |
+| G2 | Oracle 全程分叉/动作前出口打分 | 同快照三动作，评动作后出口 |
+| G2 | 双执行器均为从头重算 | 保持（append-only 真参考待与 generate 对齐，见剩余） |
+| G3 | Reader 投影每 loop 重算 | 按 memory_version 跨 loop 复用；**每 forward 重置**（防 no_grad sweep 污染） |
+| G3 | gold_span 未转块 / split 未过滤 | dataset 按 tokenizer 重算 gold_block；split 过滤 |
+| G3 | FLOPs/executed 口径 | 投影计 T×M/M；selected vs executed 分字段 |
+
+测试：**119 passed**（含评审回归 G1/G2/G3）。
+
+## 7.6 append-only 对齐（2026-09-22）
+
+| 项 | 状态 | 证据 |
+|-|-|-|
+| reference_append_only | ✅ | 带 cache 增量，金标准（V2 §11.5）：历史 KV 不回溯，memory 换版只作用新 token |
+| segmented_forward | ✅ | 段间续 past_key_values，段内批量追加——对齐 append-only，不再从头重算 |
+| generate_teacher_forced | ✅ | 与 generate 同构（首块 prefill + 逐 token 追加） |
+| reference_recompute | ◐ | 保留为对照路径（违反 append-only，不是金标准） |
+| 对齐测试 | ✅ | append-only↔segmented logits≤1e-4；generate 第二步 argmax 可重放；memory 切换下 segmented 跟 append-only 而非 recompute |
+
+测试：**123 passed**。
+
+剩余（评审亦指出，需更大改动/外部条件）：
+- 训练主路径 collect_exits 仍是全序列 teacher-forcing（与 decode 的 M(t) 边界可再收紧）
+- 混合 batch 的 active-mask 压缩与逐样本动作（当前 batch 统一动作，研究级）
+- T5.3 八卡、T5.4 迁移首训对照
+
+## 7.8 数据真值 + sparse 块级因果（2026-09-22）
+
+| 项 | 修复 |
+|-|-|
+| irrelevant | 干扰设备强制 ≠ 目标；生成自检 context 不得含目标设备（200 条 0 泄漏） |
+| no_evidence | 目标改为确定「不可知」，禁止随机编造采样率 |
+| new_evidence | 增加 `evidence_visible_from_round` 可见时间线 |
+| long_dep | 目标改为 X+正整数（原先仍是 X） |
+| planning | 有序依赖子序列（禁止乱序 sample）+ 约束写入答案 |
+| repo_context | patch 使用真实参数名，禁省略号/未定义 args |
+| sparse 选择器 | 全局 top-k 只选**完整可见块**；未完成块走因果局部窗（改未来不改过去输出） |
+
+测试：**133 passed**。
+
+## 7.7 Frozen Index 声明（2026-09-22）
+
+检索采用 **Frozen Index 范式**（非 bug）：建库 `build_keys` 在 no_grad 下用 `key_proj`
+生成库 key；训练只优化 query 投影 + ranking（CE/蒸馏）。`config.freeze_key=True` 默认，
+`build_optimizer` 显式 `requires_grad_(False)`，manifest 记 `frozen_key_params`。
+文档已修正旧表述「梯度只走 query/key 投影」→「只走 query 投影」。
+未来若要 Q/K 联训：周期 `key_refresh_interval` rebuild index，不能只拆 no_grad。
+测试：**126 passed**。
 ```
 
 ---

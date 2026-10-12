@@ -73,6 +73,10 @@ class MiniMindXModel(nn.Module):
         self.memory_manager = MemoryManager(config) if config.use_memory else None
         from .retrieval.qsa_retriever import QSARetriever  # 延迟导入避免循环依赖
         self.retriever = QSARetriever(config) if config.use_retrieval else None
+        # Frozen Index（P0）：构造即冻结 key_proj（不等到 optimizer——否则任意
+        # 优化器/纯 forward 误训会破坏索引一致性）
+        if self.retriever is not None and getattr(config, "freeze_key", True):
+            self.retriever.key_proj.weight.requires_grad_(False)
 
     # ------------------------------------------------------------------ utils
     def _start_pos(self, past_key_values):
@@ -163,7 +167,7 @@ class MiniMindXModel(nn.Module):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 num_loops=1, halt=False, collect_exits=False, exit_choice=None,
                 memory_kv_per_layer=None, loop_callback=None, memory_payload=None,
-                query_len=None):
+                query_len=None, collect_routers=True):
         cfg = self.config
         if hasattr(past_key_values, 'layers'):  # 兼容 transformers Cache 误传
             past_key_values = None
@@ -196,7 +200,8 @@ class MiniMindXModel(nn.Module):
         # ---- Budget Router：读 Prelude 输出（问题表示），预测预算档 ----
         # 评审 3.2：Router 输入必须与执行一致——只可见前缀，不见 gold 后缀
         router_h = hidden_states if query_len is None else hidden_states[:, :query_len]
-        budget_logits = self.budget_router(router_h) if self.budget_router is not None else None
+        budget_logits = (self.budget_router(router_h)
+                         if (self.budget_router is not None and collect_routers) else None)
 
         # ---- ThinkingCore（循环区）----
         num_loops = max(1, int(num_loops)) if cfg.use_loop else 1
@@ -288,7 +293,7 @@ class MiniMindXModel(nn.Module):
         aux_loss = self._aux_loss(hidden_states)
         # ---- T0.2（C4 修复）：全展开训练时收集 router 概率（不据此 break）----
         router_probs = None
-        if collect_exits:
+        if collect_exits and collect_routers:
             router_probs = {}
             # 评审 3.2：监督 logits 与执行同输入（可见前缀池化）
             def _vis(h):
@@ -334,7 +339,8 @@ class MiniMindXForCausalLM(nn.Module):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 logits_to_keep=0, labels=None, num_loops=None, halt=False,
                 collect_exits=False, exit_choice=None, memory_kv_per_layer=None,
-                loop_callback=None, memory_payload=None, query_len=None, **kwargs):
+                loop_callback=None, memory_payload=None, query_len=None,
+                collect_routers=True, **kwargs):
         cfg = self.config
         if num_loops is None:
             num_loops = cfg.max_loop if (collect_exits and cfg.use_loop) else 1
@@ -342,7 +348,7 @@ class MiniMindXForCausalLM(nn.Module):
                          num_loops=num_loops, halt=halt, collect_exits=collect_exits,
                          exit_choice=exit_choice, memory_kv_per_layer=memory_kv_per_layer,
                          loop_callback=loop_callback, memory_payload=memory_payload,
-                         query_len=query_len)
+                         query_len=query_len, collect_routers=collect_routers)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(out["hidden_states"][:, slice_indices, :])
         exit_logits = None

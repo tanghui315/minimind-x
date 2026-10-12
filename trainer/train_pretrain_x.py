@@ -43,17 +43,17 @@ def compute_step_loss(model, input_ids, labels, args, lm_config):
     """返回 (总损失, 日志 dict)。日志里 loss@R 逐出口记录（研究核心指标）。"""
     if not lm_config.use_loop or args.loop_mode == "fixed":
         r = max(1, args.fixed_loops)
-        res = model(input_ids, labels=labels, num_loops=r)
+        res = model(input_ids, labels=labels, num_loops=r, collect_routers=False)
         loss = res.loss + res.aux_loss
         return loss, {"loss": res.loss.item(), "r": r}
     if args.loop_mode == "random":
         r = random.randint(1, lm_config.max_loop)
-        res = model(input_ids, labels=labels, num_loops=r)
+        res = model(input_ids, labels=labels, num_loops=r, collect_routers=False)
         loss = res.loss + res.aux_loss
         return loss, {"loss": res.loss.item(), "r": r}
     if args.loop_mode != "full_unroll":
         raise ValueError(f"未知 loop_mode: {args.loop_mode}")
-    res = model(input_ids, labels=None, collect_exits=True)
+    res = model(input_ids, labels=None, collect_exits=True, collect_routers=False)
     lm, per_exit = lm_loss_per_exit(res.exit_logits, labels, lm_config.exit_loss_weighting)
     loss = lm + res.aux_loss
     if args.alpha_consistency > 0:
@@ -229,6 +229,25 @@ if __name__ == "__main__":
         model.load_state_dict(mapped, strict=False)
         Logger(f'remapped original MiniMind weights from {args.from_minimind_weight}')
 
+    # Stage-0 冻结不监督的模块（V2 §13.1：冻结参数 ≠ no_grad 前向；DDP 只同步可训练参数，
+    # 消除 find_unused 的 reducer 歧义——9-22 夜 V2 首训失败的根治方案）
+    _frozen = []
+    _raw = model
+    for _a in ("module", "_orig_mod"):
+        _raw = getattr(_raw, _a, _raw)
+    for _name in ("halt_router", "retrieve_router", "budget_router", "retriever"):
+        _mod = getattr(_raw.model, _name, None)
+        if _mod is not None:
+            for _p in _mod.parameters():
+                _p.requires_grad_(False)
+            _frozen.append(_name)
+    _reader = getattr(_raw.model.thinking_core, "memory_reader", None)
+    if _reader is not None:
+        for _p in _reader.parameters():
+            _p.requires_grad_(False)
+        _frozen.append("memory_reader")
+    if _frozen:
+        Logger(f'Stage-0 冻结（不参与本阶段训练/同步）: {_frozen}')
     if args.grad_ckpt == 1:
         set_gradient_checkpointing(model, True)
 

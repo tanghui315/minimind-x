@@ -79,7 +79,12 @@ def sft_c_step(batch):
     assert_sft_c_batch(batch["input_ids"])
     input_ids = batch["input_ids"].to(args.device)
     labels = batch["labels"].to(args.device)
-    context_ids = batch["context_ids"][0].to(args.device)  # 研究级口径：batch 内取首样本上下文
+    _ctx = batch["context_ids"]
+    # 研究级口径：batch 内取首样本；空库（no_evidence）context_ids 可能为 [0] 或 [1,0]
+    if _ctx.dim() == 1:
+        context_ids = _ctx.to(args.device)
+    else:
+        context_ids = _ctx[0].to(args.device) if _ctx.shape[0] > 0 else _ctx.new_zeros((0,)).to(args.device)
     gold_block = batch["gold_block"].to(args.device)
     query_len = int(batch["question_len"][0].item())       # T0.1：可见前缀边界（数据集提供）
     oracle_r_file = int(batch["oracle_r"][0].item())
@@ -124,6 +129,10 @@ def sft_c_step(batch):
             oracle_ret = labels_r[0].tolist()  # 回退：旧 0/1 口径
 
     ctrl = AdaptiveController(model)
+    # P1：周期 rebuild key index（key_refresh_interval>0 时；0=Frozen forever）
+    if getattr(lm_config, "key_refresh_interval", 0):
+        ctrl.begin(context_ids)  # 建库
+        ctrl.maybe_refresh_index(getattr(args, "step_global", 0))
     out, extras = ctrl.forward_with_oracles(
         input_ids, None, labels, context_ids, query_len=query_len,
         gold_block_idx=gold_block if (gold_block[0] >= 0).all() else None,

@@ -155,6 +155,40 @@ class AdaptiveController:
                         valid_tokens=mem.token_size, unique=self.stats["unique_blocks"])
         return mem
 
+    def refresh_index(self, max_blocks=None):
+        """P1：用当前 key_proj 重建库索引（Frozen Index 的周期 refresh）。
+
+        调用时机：step % key_refresh_interval == 0（训练器接线）。
+        重建后 memory/warm cache 不自动作废——若要严格一致应同时 bump memory_version。
+        """
+        if self.store is None:
+            raise RuntimeError("refresh_index 需要已 begin() 的 store")
+        self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens,
+                              max_blocks=max_blocks)
+        # 索引指纹已变：warm 候选/last_global 基于旧 K，必须失效（防 stale 重排）
+        self.warm_candidates = None
+        self.stats["last_global_result"] = None
+        if self.memory is not None:
+            self.memory = self.memory.with_usage_bumped(
+                torch.zeros_like(self.memory.usage))  # 新对象 + version 不变但 KV 缓存失效
+            self.memory.invalidate_kv()
+        self.store.set_manifest(
+            model_version=getattr(self.cfg, "architecture_version", lambda: "minimind_x")()
+            if callable(getattr(self.cfg, "architecture_version", None))
+            else str(getattr(self.cfg, "architecture_version", "minimind_x")))
+        self.stats["index_refreshes"] = self.stats.get("index_refreshes", 0) + 1
+        return self.store.metadata
+
+    def maybe_refresh_index(self, step):
+        """按 config.key_refresh_interval 周期 rebuild（0=永不，Frozen forever）。"""
+        interval = int(getattr(self.cfg, "key_refresh_interval", 0) or 0)
+        if interval <= 0 or self.store is None:
+            return False
+        if step > 0 and step % interval == 0:
+            self.refresh_index()
+            return True
+        return False
+
     def has_warm_cache(self) -> bool:
         """Warm Candidate Cache 是否可用（决定 RESCORE_WARM 是否可选，V2 §9.2）。"""
         w = self.warm_candidates
