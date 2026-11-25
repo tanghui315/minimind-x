@@ -77,7 +77,11 @@ class WorkingMemory:
         """[B, K] valid -> [B, K*block] token 级 valid（供 GatedMemoryReader）。"""
         b, k = self.valid.shape
         bs = self.block_size if k else 0
-        return self.valid.unsqueeze(-1).expand(b, k, bs).reshape(b, k * bs)
+        mask = self.valid.unsqueeze(-1).expand(b, k, bs)
+        if "context_tokens" in self.metadata:
+            positions = self.source_ids[..., None] * self.block_size + torch.arange(bs, device=mask.device)
+            mask = mask & (positions < self.metadata["context_tokens"])
+        return mask.reshape(b, k * bs)
 
     # ---- 修改操作（返回新对象，函数式；Doc 1 §10 ADD/KEEP/EVICT/REPLACE 由 manager 组合）----
     def with_added(self, hidden, keys, source_ids=None):
@@ -162,7 +166,10 @@ class WorkingMemory:
         if cache_key is not None and getattr(self, "_kv_cache_key", None) != cache_key:
             self._kv_cache = None
         if self._kv_cache is None:
-            self._kv_cache = thinking_core.project_memory(self.token_hidden())
+            payload = self.token_hidden()
+            if payload.shape[0] == 1:
+                payload = payload[:, self.token_valid()[0]]
+            self._kv_cache = thinking_core.project_memory(payload)
             self._kv_cache_key = cache_key
         return self._kv_cache
 

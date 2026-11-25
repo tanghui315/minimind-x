@@ -63,7 +63,8 @@ def test_same_snapshot_oracle_evals_post_action_exit():
     ctx = torch.randint(3, 60, (32,))
     best, mat = sweep_retrieval_action(
         m, ids, y, ctx, 4, lambda: AdaptiveController(m), num_loops=3)
-    assert mat.shape == (1, 3, 3)
+    assert best.shape == (1, 2)
+    assert mat.shape == (1, 2, 3)
     assert torch.isfinite(mat).all()
 
 
@@ -95,9 +96,9 @@ def test_dataset_split_and_gold_span():
 
     class FakeTok:
         bos_token_id, eos_token_id = 1, 2
-        def __call__(self, text, add_special_tokens=False, max_length=None, truncation=False):
+        def __call__(self, text, add_special_tokens=False, max_length=None, truncation=False, **kwargs):
             ids = [ord(c) % 50 + 3 for c in text[:max_length or 99]]
-            return type("R", (), {"input_ids": ids})()
+            return type("R", (), {"input_ids": ids, "offset_mapping": [(i, i+1) for i in range(len(ids))]})()
 
     recs = [
         {"context": "AAAA" * 32, "question": "q", "answer": "a", "split": "train",
@@ -115,4 +116,4 @@ def test_dataset_split_and_gold_span():
     item = ds_tr[0]
     # gold_span 覆盖文件里的 gold_block=9
     assert int(item["gold_block"]) >= 0
-    assert int(item["gold_block"]) != 9 or True  # 按 token 重算，不信任原 block
+    assert int(item["gold_block"]) == 0

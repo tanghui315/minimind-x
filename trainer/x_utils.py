@@ -1,5 +1,6 @@
 """MiniMind-X 训练公共工具（各 X trainer 共享；不改动原 trainer_utils.py）。"""
 import os
+from pathlib import Path
 import sys
 
 __package__ = "trainer"
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from model.model_minimind import precompute_freqs_cis
-from model.minimind_x import MiniMindXForCausalLM
+from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
 from trainer.trainer_utils import Logger, get_model_params
 
 
@@ -18,43 +19,78 @@ def x_weight_path(save_dir, name, hidden_size):
     return f'{save_dir}/{name}_{hidden_size}_x.pth'
 
 
+def _checkpoint_model(weights, meta, fallback, *, migrate=False):
+    saved = (meta or {}).get("config")
+    config = MiniMindXConfig(**saved) if saved else fallback
+    if not saved and any(k.startswith("model.thinking_core.loop_mhar.") for k in weights):
+        config.residual_v2 = True
+    if migrate:
+        config = fallback
+        if saved and saved.get("residual_v2"):
+            config.residual_v2 = True
+    model = MiniMindXForCausalLM(config)
+    if migrate:
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+        if any(k.startswith(("model.thinking_core.loop_mhar.",
+                                            "model.thinking_core.update_gate.",
+                                            "model.thinking_core.memory_reader.")) for k in unexpected):
+            raise ValueError(f"Migration would discard V2 weights: {unexpected}")
+        Logger(f'X weight migration: missing={missing}, unexpected={unexpected}')
+    else:
+        model.load_state_dict(weights, strict=True)
+    model.checkpoint_id = (meta or {}).get("checkpoint_id")
+    return model
+
+
+def load_x_for_eval(weight_dir, weight, *, hidden_size=None, preset=None, device="cpu",
+                    variant="minimind_x", num_hidden_layers=None, **legacy_options):
+    """Saved config owns inference. CLI architecture options also support legacy bare weights."""
+    from model.minimind_x.config import PRESETS
+    width = hidden_size or (PRESETS[preset]["hidden_size"] if preset else None)
+    path = Path(weight)
+    if not path.is_file():
+        if width is None:
+            directory = Path(weight_dir)
+            candidates = [p for p in directory.glob(f"{weight}_*_x.pth")
+                          if p.name[len(weight)+1:-6].isdigit()]
+            if len(candidates) > 1:
+                raise ValueError(f"Multiple checkpoints for {weight}. Specify --hidden_size or a file path.")
+            path = candidates[0] if candidates else Path(x_weight_path(weight_dir, weight, 768))
+        else:
+            path = Path(x_weight_path(weight_dir, weight, width))
+    weights, meta = load_x_checkpoint_meta(path)
+    fallback = None
+    if not (meta or {}).get("config"):
+        fallback = MiniMindXConfig(hidden_size=hidden_size, num_hidden_layers=num_hidden_layers,
+                                   preset=preset, variant=variant, **legacy_options)
+    return _checkpoint_model(weights, meta, fallback).to(device).eval()
+
+
+def bind_x_tokenizer(model, tokenizer):
+    """Attach the identity of the tokenizer which produces the index's input IDs."""
+    import hashlib
+    identity = hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest()
+    model.config.tokenizer_identity = identity
+
+
 def init_model_x(lm_config, from_weight='pretrain', tokenizer_path='../model',
                  save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if from_weight != 'none':
         path = x_weight_path(save_dir, from_weight, lm_config.hidden_size)
-        weights = torch.load(path, map_location=device, weights_only=False)
-        meta = weights.pop("__meta__", None)  # T5.2 manifest 不进 state_dict
-        # 评审 8.1：按 checkpoint config 恢复 residual_v2，禁止 V2 权重静默装进 V1 结构
-        ckpt_cfg = (meta or {}).get("config") or {}
-        ckpt_arch = (meta or {}).get("architecture_version") or ""
-        ckpt_v2 = bool(ckpt_cfg.get("residual_v2")) or ckpt_arch.endswith("residual_v2")
-        if ckpt_v2 and not getattr(lm_config, "residual_v2", False):
-            Logger(f'ckpt is residual_v2 -> force lm_config.residual_v2=True ({path})')
-            lm_config.residual_v2 = True
-        if (not ckpt_v2) and getattr(lm_config, "residual_v2", False) and ckpt_cfg:
-            Logger(f'WARN: loading non-v2 ckpt into residual_v2 model ({path})')
-        v2_keys = [k for k in weights if k.startswith((
-            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
-            "model.thinking_core.memory_reader"))]
-        if v2_keys and not getattr(lm_config, "residual_v2", False):
-            raise RuntimeError(
-                f"checkpoint 含 V2 残差模块权重但 residual_v2=False，拒绝静默丢弃: "
-                f"{v2_keys[:3]}...（评审 8.1）")
-        model = MiniMindXForCausalLM(lm_config)
-        missing, unexpected = model.load_state_dict(weights, strict=False)
-        if (meta or {}).get("architecture_version"):
-            Logger(f'ckpt meta: arch={meta.get("architecture_version")} '
-                   f'params={meta.get("param_manifest", {}).get("total")}')
-        # unexpected 中的 V2 模块 = 结构不匹配，必须报错而非打日志继续
-        bad_unexp = [k for k in unexpected if k.startswith((
-            "model.thinking_core.loop_mhar", "model.thinking_core.update_gate",
-            "model.thinking_core.memory_reader"))]
-        if bad_unexp:
-            raise RuntimeError(f"V2 模块权重被丢弃（结构不匹配）: {bad_unexp[:5]}")
-        Logger(f'loaded X weights from {path} (missing={len(missing)}, unexpected={len(unexpected)})')
+        weights, meta = load_x_checkpoint_meta(path)
+        saved = (meta or {}).get("config") or {}
+        migrate = bool(saved and (saved.get("variant") != lm_config.variant or
+                                  (lm_config.residual_v2 and not saved.get("residual_v2"))))
+        # Legacy training runs may intentionally add retrieval/reader heads to a bare checkpoint.
+        model = _checkpoint_model(weights, meta, lm_config, migrate=migrate or not saved)
+        lm_config = model.config
+        Logger(f'loaded {lm_config.architecture_version()} from {path}')
     else:
         model = MiniMindXForCausalLM(lm_config)
+    bind_x_tokenizer(model, tokenizer)
+    model.checkpoint_parent = ({"path": os.path.abspath(path), "id": (meta or {}).get("checkpoint_id")}
+                               if from_weight != "none" else None)
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     return model.to(device), tokenizer
@@ -140,7 +176,12 @@ def save_x_checkpoint(model, args_save_dir, save_weight, hidden_size,
         meta.update(extra)
     payload["__meta__"] = meta
     path = x_weight_path(args_save_dir, save_weight, hidden_size)
+    import uuid
+    meta["checkpoint_id"] = uuid.uuid4().hex
+    meta["parent_checkpoint"] = getattr(raw, "checkpoint_parent", None)
+    meta["output_path"] = os.path.abspath(path)
     torch.save(payload, path)
+    raw.last_saved_checkpoint = {"path": meta["output_path"], "id": meta["checkpoint_id"]}
     return path
 
 
@@ -279,7 +320,7 @@ def save_pretrained_x(model, out_dir):
     """研究格式的『导出』：config.json + model.pth（T7.5）。
 
     注：完整 HF transformers 格式导出需要 remote-code 建模文件，超出研究平台范围；
-    重新实例化用 MiniMindXConfig.from_json_file + load_state_dict(strict=False)。
+    加载时从 config.json 恢复架构并严格校验权重。
     """
     import json
     os.makedirs(out_dir, exist_ok=True)
@@ -304,5 +345,5 @@ def load_pretrained_x(out_dir, device="cpu"):
     weights = torch.load(os.path.join(out_dir, "model_x.pth"), map_location="cpu",
                          weights_only=False)
     weights.pop("__meta__", None)
-    model.load_state_dict(weights, strict=False)
+    model.load_state_dict(weights, strict=True)
     return model.to(device)

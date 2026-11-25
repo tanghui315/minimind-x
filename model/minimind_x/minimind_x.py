@@ -47,6 +47,15 @@ class MiniMindXOutput:
     num_loops_executed: int = 0
 
 
+@dataclass(frozen=True)
+class RoundPrefix:
+    """Single-request inference snapshot after a committed Core round, before Coda."""
+    anchor: torch.Tensor
+    prelude_kv: list
+    core: dict
+    reader_cache: tuple
+
+
 class MiniMindXModel(nn.Module):
     def __init__(self, config: MiniMindXConfig):
         super().__init__()
@@ -167,7 +176,8 @@ class MiniMindXModel(nn.Module):
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 num_loops=1, halt=False, collect_exits=False, exit_choice=None,
                 memory_kv_per_layer=None, loop_callback=None, memory_payload=None,
-                query_len=None, collect_routers=True):
+                query_len=None, collect_routers=True, halt_decision=None,
+                round_prefix=None, capture_round=False):
         cfg = self.config
         if hasattr(past_key_values, 'layers'):  # 兼容 transformers Cache 误传
             past_key_values = None
@@ -180,7 +190,11 @@ class MiniMindXModel(nn.Module):
         P, T, C = cfg.prelude_layers, cfg.thinking_layers, cfg.coda_layers
         start_pos = self._start_pos(past)
         bsz, seq_len = input_ids.shape
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        if capture_round or round_prefix is not None:
+            if self.training or torch.is_grad_enabled() or bsz != 1 or not use_cache:
+                raise ValueError("Round snapshots require single-request inference with KV cache")
+        hidden_states = (self.dropout(self.embed_tokens(input_ids)) if round_prefix is None
+                         else round_prefix.anchor)
         # RoPE buffers 在 meta-device 初始化后可能丢失（transformers>=5.x），重算
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(
@@ -193,13 +207,20 @@ class MiniMindXModel(nn.Module):
         presents = []
 
         # ---- Prelude ----
-        hidden_states, pre_presents = self.prelude(
-            hidden_states, position_embeddings, past[:P], use_cache, attention_mask)
+        if round_prefix is None:
+            hidden_states, pre_presents = self.prelude(
+                hidden_states, position_embeddings, past[:P], use_cache, attention_mask)
+        else:
+            pre_presents = round_prefix.prelude_kv
         presents += pre_presents
 
         # ---- Budget Router：读 Prelude 输出（问题表示），预测预算档 ----
         # 评审 3.2：Router 输入必须与执行一致——只可见前缀，不见 gold 后缀
         router_h = hidden_states if query_len is None else hidden_states[:, :query_len]
+        visible_len = router_h.size(1)
+        if visible_len == 0:
+            raise ValueError("router prefix must contain at least one token")
+        router_mask = None if attention_mask is None else attention_mask[:, -seq_len:][:, :visible_len]
         budget_logits = (self.budget_router(router_h)
                          if (self.budget_router is not None and collect_routers) else None)
 
@@ -208,13 +229,17 @@ class MiniMindXModel(nn.Module):
         halt_fn = None
         if halt and self.halt_router is not None:
             def halt_fn(hd, residual_stats=None):  # T2.1：committed + detached 统计
-                return self.halt_router(hd, residual_stats)
+                p = self.halt_router(hd[:, :visible_len], residual_stats, router_mask)
+                return halt_decision(p) if halt_decision is not None else p
         core_out = self.thinking_core(
             hidden_states, position_embeddings, past[P:P + T], use_cache, attention_mask,
             memory_kv_per_layer=memory_kv_per_layer, num_loops=num_loops,
             halt_fn=halt_fn, halt_threshold=cfg.halt_threshold, loop_callback=loop_callback,
             anchor=hidden_states if getattr(cfg, "residual_v2", False) else None,
-            memory_payload=memory_payload)
+            memory_payload=memory_payload, visible_len=visible_len, router_mask=router_mask, prefix=round_prefix)
+        if capture_round:
+            return RoundPrefix(hidden_states, pre_presents, core_out,
+                               (self.thinking_core._reader_kv, self.thinking_core._reader_kv_ver))
         exits, passes = core_out["exit_hiddens"], core_out["presents_per_pass"]
         halt_probs, exit_idx = core_out["halt_probs"], core_out["exit_idx"]
         n_run = len(exits)
@@ -222,7 +247,7 @@ class MiniMindXModel(nn.Module):
 
         if collect_exits:
             # 每个 exit 各自过 coda+norm（per-exit 监督的诚实语义：停在 r 轮 = 深度 r 的完整模型）
-            exit_hiddens = [self._run_coda(h, position_embeddings, None, False, attention_mask)[0]
+            exit_hiddens = [self._run_coda(h, position_embeddings, past[P + T:], False, attention_mask)[0]
                             for h in exits]
             hidden_states = exit_hiddens[-1]
         else:
@@ -301,7 +326,7 @@ class MiniMindXModel(nn.Module):
             if self.halt_router is not None:
                 rs_list = core_out.get("residual_stats") or [None] * len(exits)
                 router_probs["halt"] = [
-                    self.halt_router(_vis(h), rs) for h, rs in zip(exits, rs_list)]
+                    self.halt_router(_vis(h), rs, router_mask) for h, rs in zip(exits, rs_list)]
             if self.retrieve_router is not None:
                 router_probs["retrieval"] = [self.retrieve_router(_vis(h)) for h in exits]
                 router_probs["retrieval_action"] = [
@@ -309,11 +334,11 @@ class MiniMindXModel(nn.Module):
                     for h in exits]
         # T2.4：halt_logits（非概率）+ residual_stats + memory_versions
         halt_logits_out = None
-        if collect_exits and self.halt_router is not None:
+        if collect_exits and collect_routers and self.halt_router is not None:
             rs_list = core_out.get("residual_stats") or [None] * len(exits)
             halt_logits_out = [
                 self.halt_router.forward_logits(
-                    h if query_len is None else h[:, :query_len], rs)
+                    h[:, :visible_len], rs, router_mask)
                 for h, rs in zip(exits, rs_list)]
         residual_stats = core_out.get("residual_stats")
         return dict(hidden_states=hidden_states, presents=presents, aux_loss=aux_loss,
@@ -340,7 +365,9 @@ class MiniMindXForCausalLM(nn.Module):
                 logits_to_keep=0, labels=None, num_loops=None, halt=False,
                 collect_exits=False, exit_choice=None, memory_kv_per_layer=None,
                 loop_callback=None, memory_payload=None, query_len=None,
-                collect_routers=True, **kwargs):
+                collect_routers=True, retrieval_loss_fn=None, execution_fn=None, halt_decision=None, round_prefix=None, **kwargs):
+        if execution_fn is not None:
+            return execution_fn(self, input_ids)
         cfg = self.config
         if num_loops is None:
             num_loops = cfg.max_loop if (collect_exits and cfg.use_loop) else 1
@@ -348,7 +375,8 @@ class MiniMindXForCausalLM(nn.Module):
                          num_loops=num_loops, halt=halt, collect_exits=collect_exits,
                          exit_choice=exit_choice, memory_kv_per_layer=memory_kv_per_layer,
                          loop_callback=loop_callback, memory_payload=memory_payload,
-                         query_len=query_len, collect_routers=collect_routers)
+                         query_len=query_len, collect_routers=collect_routers, halt_decision=halt_decision,
+                         round_prefix=round_prefix)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(out["hidden_states"][:, slice_indices, :])
         exit_logits = None
@@ -358,7 +386,7 @@ class MiniMindXForCausalLM(nn.Module):
         if labels is not None:  # 兼容现有 trainer：默认用最终 exit 的 CE（联合 loss 见 losses.py）
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return MiniMindXOutput(
+        output = MiniMindXOutput(
             loss=loss, aux_loss=out["aux_loss"], logits=logits,
             past_key_values=out["presents"], hidden_states=out["hidden_states"],
             exit_logits=exit_logits, exit_hiddens=out["exit_hiddens"],
@@ -371,6 +399,10 @@ class MiniMindXForCausalLM(nn.Module):
             budget_logits=out["budget_logits"], num_loops_executed=out["num_loops_executed"],
             router_probs=out.get("router_probs"),
             router_trace=out.get("router_trace"))
+        if retrieval_loss_fn is not None:
+            # DDP traverses standard containers to handle unused outputs on each rank.
+            return vars(output), retrieval_loss_fn()
+        return output
 
     # ------------------------------------------------------------------ generate
     @torch.inference_mode()
@@ -378,7 +410,7 @@ class MiniMindXForCausalLM(nn.Module):
                  top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True,
                  num_return_sequences=1, do_sample=True, repetition_penalty=1.0,
                  mode=None, fixed_loops=None, use_halting=True, memory_provider=None,
-                 loop_callback=None, return_stats=False, **kwargs):
+                 loop_callback=None, return_stats=False, step_observer=None, **kwargs):
         """在原 MiniMind generate 基础上增加（T2.4/T6.3）：
           mode: "fast"/"normal"/"deep" —— 循环与 memory 预算上限（config.mode_caps）
           fixed_loops: 固定 R（RL/评测用），关闭早停
@@ -405,6 +437,7 @@ class MiniMindXForCausalLM(nn.Module):
         # decode 再按 token 自适应；TTFT 与 decode 成本分开记
         prefill_policy = getattr(cfg, "prefill_policy", "fixed_cap")
         r_prefill = min(loop_cap, cfg.max_loop) if prefill_policy == "fixed_cap" else None
+        executed_rounds = 0
         for step in range(max_new_tokens):
             past_len = (past_key_values[0][0][0].shape[1] if isinstance(past_key_values[0], list)
                         else past_key_values[0][0].shape[1]) if past_key_values else 0
@@ -454,6 +487,9 @@ class MiniMindXForCausalLM(nn.Module):
                 n_sel = float((outputs.exit_idx + 1).float().mean().item())
             else:
                 n_sel = float(num_loops)
+            executed_rounds += outputs.num_loops_executed
+            if step_observer is not None:
+                step_observer(input_ids.size(1) - 1 - past_len, past_len, outputs.num_loops_executed)
             stats["loop_sum"] += n_sel
             stats["steps"] += 1
             if is_prefill:
@@ -476,7 +512,7 @@ class MiniMindXForCausalLM(nn.Module):
             stats["avg_decode_loops"] = stats["decode_loop_sum"] / max(stats["decode_steps"], 1)
             # 评审 9.4：selected=样本选中出口；executed=物理执行轮（fixed/自适应上界）
             stats["selected_core_rounds"] = stats["loop_sum"]
-            stats["executed_core_rounds"] = stats["loop_sum"]  # 无 active-mask 压缩时二者相近
+            stats["executed_core_rounds"] = executed_rounds  # 无 active-mask 压缩时二者相近
             return {'generated_ids': input_ids, 'stats': stats,
                     'past_kv': past_key_values} if kwargs.get("return_kv") else \
                    {'generated_ids': input_ids, 'stats': stats}

@@ -110,7 +110,8 @@ def halt_bce_loss(halt_probs: List[torch.Tensor], oracle_r: torch.Tensor,
     if valid is not None:
         mask = mask * valid.to(mask.device).float().unsqueeze(1)
     probs = torch.stack(halt_probs).transpose(0, 1).clamp(1e-6, 1 - 1e-6)  # [B,R]
-    bce = F.binary_cross_entropy(probs, labels, reduction="none")
+    with torch.autocast(device_type=probs.device.type, enabled=False):
+        bce = F.binary_cross_entropy(probs.float(), labels.float(), reduction="none")
     return (bce * mask).sum() / mask.sum().clamp(min=1.0)
 
 
@@ -118,7 +119,8 @@ def retrieval_bce_loss(retrieve_probs: List[torch.Tensor], oracle_retrieve: torc
     """每轮是否再检索的 BCE。oracle_retrieve: [R]（0/1，逐轮决策）。"""
     probs = torch.stack(retrieve_probs).clamp(1e-6, 1 - 1e-6)     # [R,B]
     labels = oracle_retrieve.to(probs.device).unsqueeze(1).expand_as(probs)
-    return F.binary_cross_entropy(probs, labels.float())
+    with torch.autocast(device_type=probs.device.type, enabled=False):
+        return F.binary_cross_entropy(probs.float(), labels.float())
 
 
 def retrieval_action_ce_loss(action_logits: List[torch.Tensor],
@@ -140,6 +142,8 @@ def retrieval_action_ce_loss(action_logits: List[torch.Tensor],
         am = torch.stack(action_masks)  # [R,B,3]
         lab_oh = F.one_hot(labels.long().clamp(min=0), num_classes=logits.shape[-1]).to(mask.dtype)
         mask = (am.to(mask.dtype) * lab_oh).sum(dim=-1)  # 标签动作是否可用
+        logits = logits.masked_fill(~am, -torch.inf)
+        labels = torch.where(mask.bool(), labels, torch.zeros_like(labels))
     # 不可用动作（如无 warm cache 的 RESCORE_WARM）在 logits 上 -inf，CE 对其零贡献
     ce = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]), labels.reshape(-1).long(),

@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# H20 8 卡启动脚本（任务清单 T7.5；Doc 5 §27）
-# 用法：bash scripts/launch_h20_8card.sh <stage> [额外参数...]
-#   stage ∈ {pretrain, longctx, sft_a, sft_b, sft_c, grpo1, grpo2, grpo3}
-set -e
+# Follow the checkpoint produced by the preceding stage. Paths in overrides are
+# relative to the repository root, including paths with spaces.
+set -eu
 cd "$(dirname "$0")/.."
-
-NNODES=${NNODES:-1}
-NPROC=${NPROC:-8}
-STAGE=${1:?用法: launch_h20_8card.sh <pretrain|longctx|sft_a|sft_b|sft_c|grpo1|grpo2|grpo3> [args...]}
-shift || true
-
-case "$STAGE" in
-  pretrain) CMD="trainer/train_pretrain_x.py --variant minimind_x --preset M --loop_mode full_unroll --grad_ckpt 1 $*" ;;
-  longctx)  CMD="trainer/train_long_context.py --variant dense --preset M --stage_lens 8192,32768,131072 --steps_per_stage 2000,2000,2000 --grad_ckpt 1 $*" ;;
-  sft_a)    CMD="trainer/train_sft_x.py --phase a --variant minimind_x --preset M $*" ;;
-  sft_b)    CMD="trainer/train_sft_x.py --phase b --variant minimind_x --preset M --full_unroll_ratio 0.25 --alpha_consistency 0.1 $*" ;;
-  sft_c)    CMD="trainer/train_sft_x.py --phase c --variant minimind_x --preset M --oracle_rate 0.1 --train_halt_router 1 $*" ;;
-  grpo1)    CMD="trainer/train_grpo_x.py --rl_phase 1 --variant minimind_x --preset M $*" ;;
-  grpo2)    CMD="trainer/train_grpo_x.py --rl_phase 2 --variant minimind_x --preset M $*" ;;
-  grpo3)    CMD="trainer/train_grpo_x.py --rl_phase 3 --variant minimind_x --preset M $*" ;;
-  *) echo "未知 stage: $STAGE"; exit 1 ;;
+stage=${1:?expected pretrain, longctx, sft_a/b/c or grpo1/2/3}
+shift
+common=(--variant minimind_x --tokenizer_path model --save_dir out)
+preset=${MMX_PRESET-M}
+if [[ -n "$preset" ]]; then common+=(--preset "$preset"); fi
+case "$stage" in
+  pretrain)
+    cmd=(trainer/train_pretrain_x.py --data_path dataset/pretrain_t2t_mini.jsonl --loop_mode full_unroll --grad_ckpt 1) ;;
+  longctx)
+    cmd=(trainer/train_long_context.py --data_path dataset/pretrain_t2t_mini.jsonl --from_weight pretrain_x --steps_per_stage 2000,2000,2000) ;;
+  sft_a|sft_b|sft_c)
+    phase=${stage#sft_}
+    cmd=(trainer/train_sft_x.py --phase "$phase" --data_path dataset/sft_t2t_mini.jsonl --retrieval_data_path dataset/retrieval_qa.jsonl)
+    if [[ "$phase" == a ]]; then cmd+=(--from_weight longctx_x_stage2); fi ;;
+  grpo1|grpo2|grpo3)
+    phase=${stage#grpo}
+    cmd=(trainer/train_grpo_x.py --rl_phase "$phase" --data_path dataset/agent_rl_math.jsonl) ;;
+  *) echo "Unknown stage: $stage" >&2; exit 1 ;;
 esac
-
-echo "[launch] torchrun --nproc_per_node=$NPROC $CMD"
-exec torchrun --nproc_per_node="$NPROC" --nnodes="$NNODES" $CMD
+launcher=(torchrun)
+if [[ -n "${MMX_PYTHON:-}" ]]; then launcher=("$MMX_PYTHON" -m torch.distributed.run); fi
+exec "${launcher[@]}" --master_port="${MASTER_PORT:-29500}" --nproc_per_node="${NPROC:-8}" --nnodes="${NNODES:-1}" "${cmd[@]}" "${common[@]}" "$@"

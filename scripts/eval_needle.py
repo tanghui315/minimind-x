@@ -6,13 +6,15 @@
   数据集   ：--data xxx.jsonl（直接评 multihop / repo / planning 等检索式数据，
              覆盖 Doc 1 §26 的 Multi-hop QA 与 Long Code）
 
-EM 判定：answer（精确字符串）出现在生成文本中。
+EM 判定：Unicode 规范化并整理空白后比较整条答案。
 """
 import os
 import sys
 import json
 import argparse
 import random
+import unicodedata
+from collections import defaultdict
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.join(os.path.dirname(__file__), "data_gen"))
@@ -20,17 +22,28 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "data_gen"))
 import torch
 from transformers import AutoTokenizer
 
-from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
+from dataset.retrieval_qa_dataset import encode_evidence
 from model.minimind_x.controller import AdaptiveController
-from trainer.x_utils import x_weight_path, tokenize_tensors
+from trainer.x_utils import bind_x_tokenizer, load_x_for_eval, tokenize_tensors
 
 
-def run_one(model, tokenizer, ctrl, args, cfg, sample):
-    ctx_ids = tokenizer(sample["context"], add_special_tokens=False).input_ids
+def exact_match(prediction, answer):
+    def normalize(value):
+        return " ".join(unicodedata.normalize("NFKC", str(value)).split())
+    return normalize(prediction) == normalize(answer)
+
+
+def run_one(model, tokenizer, args, cfg, sample):
+    ctx_ids, gold, visibility = encode_evidence(sample, tokenizer, cfg.block_size)
     q_ids = tokenizer(sample["question"], add_special_tokens=False).input_ids
     ids = torch.tensor([q_ids], device=args.device)
     if args.mode == "backbone":
-        total = (ctx_ids + q_ids)[:cfg.max_position_embeddings - 1]
+        if visibility.any():
+            raise ValueError("delayed evidence requires retrieval mode")
+        available = cfg.max_position_embeddings - args.max_new_tokens - len(q_ids)
+        if available < 0:
+            raise ValueError("question and generation budget exceed the backbone window")
+        total = ctx_ids[:available].tolist() + q_ids
         ids = torch.tensor([total], device=args.device)
         out = model.generate(inputs=ids, attention_mask=torch.ones_like(ids),
                              max_new_tokens=args.max_new_tokens, do_sample=False,
@@ -38,15 +51,30 @@ def run_one(model, tokenizer, ctrl, args, cfg, sample):
         resp = tokenizer.decode(out[0][ids.shape[1]:].tolist(), skip_special_tokens=True)
         stats = {}
     else:
+        ctrl = AdaptiveController(model, block_visible_from=visibility)
         out = ctrl.generate_with_context(
             ids, attention_mask=torch.ones_like(ids),
-            context_ids=torch.tensor(ctx_ids, device=args.device),
+            context_ids=ctx_ids.to(args.device),
             max_new_tokens=args.max_new_tokens, do_sample=False,
             eos_token_id=tokenizer.eos_token_id)
         resp = tokenizer.decode(out["generated_ids"][0][ids.shape[1]:].tolist(),
                                 skip_special_tokens=True)
         stats = out["stats"]
-    return int(str(sample["answer"]) in resp), stats
+    stats["context_tokens"] = len(ctx_ids)
+    stats["evaluated_context_tokens"] = min(len(ctx_ids), available) if args.mode == "backbone" else len(ctx_ids)
+    stats["gold_block"] = gold
+    stats["evidence_depth"] = None
+    if gold >= 0 and len(ctx_ids):
+        from dataset.retrieval_qa_dataset import token_span
+        span = sample.get("gold_span")
+        position = min(len(ctx_ids) - 1, (gold + 0.5) * cfg.block_size)
+        if span and span[0] >= 0:
+            offsets = tokenizer(sample["context"], add_special_tokens=False, return_offsets_mapping=True).offset_mapping
+            bounds = token_span(offsets, span)
+            if bounds:
+                position = (bounds[0] + bounds[1] - 1) / 2
+        stats["evidence_depth"] = position / len(ctx_ids)
+    return int(exact_match(resp, sample["answer"])), stats
 
 
 def main():
@@ -55,8 +83,8 @@ def main():
     p.add_argument("--weight", type=str, default="longctx_x_stage2")
     p.add_argument("--tokenizer_path", type=str, default="../model")
     p.add_argument("--variant", type=str, default="minimind_x")
-    p.add_argument("--hidden_size", type=int, default=768)
-    p.add_argument("--num_hidden_layers", type=int, default=8)
+    p.add_argument("--hidden_size", type=int, default=None)
+    p.add_argument("--num_hidden_layers", type=int, default=None)
     p.add_argument("--mode", type=str, default="retrieval", choices=["backbone", "retrieval"])
     p.add_argument("--data", type=str, default=None,
                    help="检索式 jsonl（needle/multihop/repo/planning）；给出则忽略深度网格")
@@ -69,52 +97,53 @@ def main():
     p.add_argument("--out", type=str, default="experiments/needle.json")
     args = p.parse_args()
 
-    cfg = MiniMindXConfig(variant=args.variant, hidden_size=args.hidden_size,
-                          num_hidden_layers=args.num_hidden_layers)
-    model = MiniMindXForCausalLM(cfg)
-    model.load_state_dict(torch.load(x_weight_path(args.weight_dir, args.weight, cfg.hidden_size),
-                                     map_location="cpu"), strict=False)
-    model = model.to(args.device).eval()
+    model = load_x_for_eval(args.weight_dir, args.weight, device=args.device,
+                            hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
+                            variant=args.variant)
+    cfg = model.config
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    bind_x_tokenizer(model, tokenizer)
     rng = random.Random(7)
-    ctrl = AdaptiveController(model) if args.mode == "retrieval" else None
 
-    cells = []
+    groups = defaultdict(list)
     if args.data:
-        with open(args.data, encoding="utf-8") as f:
-            samples = [json.loads(l) for l in f if l.strip()][:args.n_per_cell]
-        correct, agg = 0, {"avg_loops": 0.0, "retrievals": 0, "memory_tokens": 0, "n": 0}
-        for s in samples:
-            hit, stats = run_one(model, tokenizer, ctrl, args, cfg, s)
-            correct += hit
-            if stats:
-                agg["avg_loops"] += stats.get("avg_loops", 0)
-                agg["retrievals"] += stats.get("retrievals", 0)
-                agg["memory_tokens"] += stats.get("memory_tokens_final", 0)
-                agg["n"] += 1
-        n = max(len(samples), 1)
-        row = {"cell": os.path.basename(args.data), "n": n, "acc": correct / n}
-        if agg["n"]:
-            row.update({k: agg[k] / agg["n"] for k in ("avg_loops", "retrievals", "memory_tokens")})
-        cells.append(row)
-        print(f"[{row['cell']}] n={n} acc={row['acc']:.2f}" +
-              (f" loops={row.get('avg_loops', 0):.2f} retr={row.get('retrievals', 0):.1f}" if agg["n"] else ""))
+        def examples():
+            with open(args.data, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        sample = json.loads(line)
+                        if sample.get("split", "val") == "val":
+                            yield "data", sample
     else:
         from gen_needle import gen_sample
-        depths_list = [float(x) for x in args.depths.split(",")]
-        for depth in depths_list:
-            correct = 0
-            for _ in range(args.n_per_cell):
-                s = (gen_sample(rng, args.ctx_tokens, depths_list, args.needles, cfg.block_size)
-                     if args.needles > 1 else
-                     gen_sample(rng, args.ctx_tokens, [depth], 1, cfg.block_size))
-                hit, _ = run_one(model, tokenizer, ctrl, args, cfg, s)
-                correct += hit
-            acc = correct / args.n_per_cell
-            cells.append({"cell": f"depth={depth:.1f}", "depth": depth,
-                          "needles": args.needles, "acc": acc})
-            print(f"depth={depth:.1f} needles={args.needles}  acc={acc:.2f}")
-
+        def examples():
+            for depth in map(float, args.depths.split(",")):
+                for _ in range(args.n_per_cell):
+                    positions = [depth] + [rng.random() for _ in range(args.needles - 1)]
+                    yield depth, gen_sample(rng, args.ctx_tokens, positions, args.needles,
+                                            cfg.block_size, tokenizer, target_needle=0)
+    for cell, sample in examples():
+        hit, stats = run_one(model, tokenizer, args, cfg, sample)
+        actual = stats["evidence_depth"]
+        depth_bin = min(9, int(actual * 10)) if actual is not None else None
+        length = stats["context_tokens"]
+        key = (cell, sample.get("family", "needle" if not args.data else "unspecified"),
+               length.bit_length(), depth_bin)
+        groups[key].append((hit, stats))
+    if not groups:
+        raise ValueError("No evaluation samples in the requested file")
+    cells = []
+    for (cell, family, bits, depth_bin), rows in groups.items():
+        hits = sum(hit for hit, _ in rows)
+        reported = {"cell": cell, "family": family, "min_context_tokens": min(s["context_tokens"] for _, s in rows),
+                    "max_context_tokens": max(s["context_tokens"] for _, s in rows),
+                    "depth_decile": depth_bin, "n": len(rows), "correct": hits, "acc": hits / len(rows),
+                    "truncated_contexts": sum(s["evaluated_context_tokens"] < s["context_tokens"] for _, s in rows)}
+        for metric in ("avg_loops", "retrievals", "actual_valid_tokens"):
+            if metric in rows[0][1]:
+                reported[metric] = sum(s[metric] for _, s in rows) / len(rows)
+        cells.append(reported)
+        print(reported)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump({"mode": args.mode, "ctx_tokens": args.ctx_tokens, "cells": cells,

@@ -8,6 +8,7 @@ jsonl schema：{"context": str, "question": str, "answer": str,
 主干序列只含 问题+答案（长上下文走 store，D9）；context 分块 tokenize 供建库。
 batch 内变长，默认 collate 成 B=1 的 dict（研究级口径；训练器可用任意 B 自行 pad）。
 """
+from bisect import bisect_left, bisect_right
 import json
 import os
 
@@ -15,6 +16,52 @@ import torch
 from torch.utils.data import Dataset
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def token_span(offsets, span):
+    """Map a complete character span to a half-open range of tokenizer positions."""
+    if not span or not offsets:
+        return None
+    start, end = span
+    if start < 0 or end <= start or end > offsets[-1][1]:
+        return None
+    first = bisect_right(offsets, start, key=lambda pair: pair[1])
+    last = bisect_left(offsets, end, key=lambda pair: pair[0])
+    return (first, last) if first < last else None
+
+
+def encode_evidence(record, tokenizer, block_size, max_tokens=None):
+    context = record.get("context", "")
+    span = record.get("gold_span")
+    # Earlier Needle files retained the literal needles and one numerical answer.
+    if span and span[0] < 0:
+        span = None
+    if span is None and record.get("needles"):
+        matches = [n for n in record["needles"] if n.endswith(f' {record["answer"]}。') and n in context]
+        if len(matches) == 1:
+            start = context.index(matches[0])
+            span = (start, start + len(matches[0]))
+    encoded = tokenizer(context, add_special_tokens=False, truncation=max_tokens is not None,
+                        max_length=max_tokens, return_offsets_mapping=bool(span))
+    ids = torch.tensor(encoded.input_ids, dtype=torch.long)
+    n_blocks = (len(ids) + block_size - 1) // block_size
+    blocks = torch.zeros(n_blocks, dtype=torch.long)
+    gold = record.get("gold_block", -1)
+    visible_from = record.get("evidence_visible_from_round", 0)
+    if span:
+        offsets = encoded.offset_mapping
+        end = min(span[1], offsets[-1][1]) if offsets else 0
+        positions = token_span(offsets, (span[0], end))
+        gold = -1
+        if positions:
+            first, last = positions
+            # A truncated fragment is still hidden until its release round.
+            blocks[first // block_size:(last - 1) // block_size + 1] = visible_from
+            if end == span[1]:
+                gold = (first + last - 1) // 2 // block_size
+    elif 0 <= gold < n_blocks:
+        blocks[gold] = visible_from
+    return ids, gold if 0 <= gold < n_blocks else -1, blocks
 
 
 class RetrievalQADataset(Dataset):
@@ -38,21 +85,6 @@ class RetrievalQADataset(Dataset):
                     continue
                 self.samples.append(rec)
 
-    def _gold_block_from_span(self, context, gold_span):
-        """评审 7.1：gold_span 字符偏移 → 真实 token 块号（按当前 tokenizer/block_size）。"""
-        if not gold_span or gold_span[0] < 0 or not context:
-            return -1
-        start, end = int(gold_span[0]), int(gold_span[1])
-        # 前缀 tokenize 定位 start 对应 token 下标
-        prefix_ids = self.tokenizer(context[:start], add_special_tokens=False).input_ids
-        span_ids = self.tokenizer(context[start:end], add_special_tokens=False).input_ids
-        if not span_ids:
-            return -1
-        tok_start = len(prefix_ids)
-        tok_end = tok_start + max(1, len(span_ids))
-        mid = (tok_start + tok_end - 1) // 2
-        return int(mid // max(1, self.block_size))
-
     def __len__(self):
         return len(self.samples)
 
@@ -69,18 +101,17 @@ class RetrievalQADataset(Dataset):
         # "答案："前缀与 gold answer 对检索 query 不可见
         question_len = 1 + len(q_ids)
         labels = [-100] * question_len + [-100] * len(ans_prefix) + a_ids + [self.tokenizer.eos_token_id]
-        ctx_ids = self.tokenizer(s["context"], add_special_tokens=False,
-                                 max_length=self.max_context_tokens,
-                                 truncation=True).input_ids if s.get("context") else []
+        ctx_ids, gold, rounds = encode_evidence(s, self.tokenizer, self.block_size, self.max_context_tokens)
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "question_len": torch.tensor(question_len, dtype=torch.long),
-            "context_ids": torch.tensor(ctx_ids, dtype=torch.long),
-            "gold_block": torch.tensor(
-                self._gold_block_from_span(s.get("context", ""), s.get("gold_span"))
-                if s.get("gold_span") and s.get("gold_span", [-1])[0] >= 0
-                else s.get("gold_block", -1), dtype=torch.long),
+            "context_ids": ctx_ids,
+            "gold_truncated": torch.tensor(self.max_context_tokens is not None and gold < 0 and
+                                           (s.get("gold_block", -1) >= 0 or bool(s.get("gold_span"))) and
+                                           encode_evidence(s, self.tokenizer, self.block_size)[1] >= 0),
+            "gold_block": torch.tensor(gold, dtype=torch.long),
+            "block_visible_from": rounds,
             "oracle_r": torch.tensor(s.get("oracle_r", 0), dtype=torch.long),
             "oracle_retrieve": torch.tensor(s.get("oracle_retrieve", []), dtype=torch.long),
             "action_schema_version": s.get("action_schema_version", 1),
@@ -111,5 +142,6 @@ def collate_retrieval_qa(batch, pad_id=0):
         out[key] = torch.stack([b[key] for b in batch])
     out["oracle_retrieve"] = [b["oracle_retrieve"] for b in batch]
     out["action_schema_version"] = [b.get("action_schema_version", 1) for b in batch]
+    out["block_visible_from"] = [b["block_visible_from"] for b in batch]
     out["answer_text"] = [b["answer_text"] for b in batch]
     return out

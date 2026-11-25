@@ -8,10 +8,18 @@ import torch
 from torch import nn
 
 
-def pool_hidden(hidden, pool="mean"):
+def pool_hidden(hidden, pool="mean", mask=None):
     """[B,S,d] -> [B,d]（decode 时 S=1，两种池化等价）。"""
     if hidden.dim() == 2:
         return hidden
+    if mask is not None:
+        if pool == "last":
+            positions = torch.arange(hidden.size(1), device=hidden.device)
+            last = positions.masked_fill(~mask.bool(), -1).amax(dim=1)
+            row = torch.arange(hidden.size(0), device=hidden.device)
+            return hidden[row, last.clamp_min(0)] * (last >= 0).unsqueeze(-1)
+        weights = mask.unsqueeze(-1).to(hidden.dtype)
+        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
     if pool == "last":
         return hidden[:, -1, :]
     return hidden.mean(dim=1)
@@ -28,21 +36,12 @@ class HaltRouter(nn.Module):
         self.stats_proj = nn.Linear(3, 1, bias=False)
         nn.init.zeros_(self.stats_proj.weight)
 
-    def forward(self, hidden, residual_stats=None):
-        pooled = pool_hidden(hidden, self.pool)
-        logit = self.proj(pooled)
-        if residual_stats is not None:
-            stats = torch.stack([
-                residual_stats["gate_mean"],
-                residual_stats["delta_cand"],
-                residual_stats["delta_commit"],
-            ], dim=-1).to(logit.dtype).to(logit.device)
-            logit = logit + self.stats_proj(stats)
-        return torch.sigmoid(logit).squeeze(-1)
+    def forward(self, hidden, residual_stats=None, mask=None):
+        return torch.sigmoid(self.forward_logits(hidden, residual_stats, mask))
 
-    def forward_logits(self, hidden, residual_stats=None):
+    def forward_logits(self, hidden, residual_stats=None, mask=None):
         """T2.4：返回 halt logit（非概率）。"""
-        pooled = pool_hidden(hidden, self.pool)
+        pooled = pool_hidden(hidden, self.pool, mask)
         logit = self.proj(pooled)
         if residual_stats is not None:
             stats = torch.stack([

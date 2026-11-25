@@ -65,17 +65,13 @@ def compute_step_loss(model, input_ids, labels, args, lm_config):
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
-    last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        if args.residual_w2 if False else False:
-            pass
         if getattr(args, 'residual_warmup_steps', 0) > 0:
             frac = residual_progress(step, args.residual_warmup_steps)
             eta, lam = apply_residual_progress(model, frac)
@@ -83,11 +79,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 Logger(f'residual warm-up: step={step} frac={frac:.3f} eta={eta:.3f} lambda={lam:.3f}')
         with autocast_ctx:
             loss, log_info = compute_step_loss(model, input_ids, labels, args, lm_config)
-            loss = loss / args.accumulation_steps
+            window_start = (step - 1) // args.accumulation_steps * args.accumulation_steps
+            loss = loss / min(args.accumulation_steps, iters - window_start)
 
         scaler.scale(loss).backward()
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -120,21 +117,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
                           scaler=scaler, epoch=epoch + 1 if done else epoch,
                           step=0 if done else step, batch_size=args.batch_size,
-                          wandb=wandb, save_dir=CKPT_DIR)
+                          wandb=wandb, save_dir=args.checkpoint_dir)
             model.train()
 
         del input_ids, labels, loss
 
-    if last_step > start_step and last_step % args.accumulation_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind-X Pretraining")
+    parser.add_argument("--checkpoint_dir", default=CKPT_DIR, help="resume checkpoint directory")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain_x', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
@@ -187,8 +178,8 @@ if __name__ == "__main__":
                         help="V2 迁移热身步数（η/λ 0→1；0=从头恒 1）")
     args = parser.parse_args()
 
-    local_rank = init_distributed_mode()
-    if dist.is_initialized():
+    local_rank = init_distributed_mode(args.device)
+    if dist.is_initialized() and torch.device(args.device).type == "cuda":
         args.device = f"cuda:{local_rank}"
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
 
@@ -206,7 +197,7 @@ if __name__ == "__main__":
                                  core_attn=args.core_attn,
                                  coda_attn=args.coda_attn).items() if v is not None})
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
-                             save_dir=CKPT_DIR) if args.from_resume == 1 else None
+                             save_dir=args.checkpoint_dir) if args.from_resume == 1 else None
 
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -222,6 +213,7 @@ if __name__ == "__main__":
     model, tokenizer = init_model_x(lm_config, args.from_weight,
                                     tokenizer_path=args.tokenizer_path,
                                     save_dir=args.save_dir, device=args.device)
+    lm_config = model.config
     if args.from_minimind_weight != 'none':
         from model.minimind_x import remap_minimind_state_dict
         orig = torch.load(args.from_minimind_weight, map_location=args.device)
@@ -281,7 +273,7 @@ if __name__ == "__main__":
     if dist.is_initialized():
         # X 模型的 router/memory 模块按训练阶段激活（Stage 0 不监督 router），
         # 必须放开 unused 检测，否则 DDP 在第二轮 reduction 报错
-        model = DistributedDataParallel(model, device_ids=[local_rank],
+        model = DistributedDataParallel(model, device_ids=[local_rank] if device_type == "cuda" else None,
                                         broadcast_buffers=False,
                                         find_unused_parameters=True)
 

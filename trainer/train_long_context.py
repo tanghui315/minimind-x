@@ -13,6 +13,7 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datasets  # noqa: F401
+import hashlib
 import argparse
 import time
 import warnings
@@ -44,34 +45,45 @@ def train_stage(stage_idx, stage_cfg, epoch, iters, wandb=None):
     train_ds = LongContextPretrainDataset(args.data_path, tokenizer,
                                           max_length=stage_cfg["max_len"],
                                           needle_ratio=args.needle_ratio,
-                                          needle_weight=args.needle_weight)
-    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True,
-                        collate_fn=collate_long_context)
+                                          needle_weight=args.needle_weight,
+                                          seed=42 + stage_idx,
+                                          min_chunks=dist.get_world_size() if dist.is_initialized() else 1)
+    sampler = DistributedSampler(train_ds, drop_last=True, seed=42 + stage_idx) if dist.is_initialized() else None
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
+                        num_workers=args.num_workers, pin_memory=True, collate_fn=collate_long_context)
+    total_steps = stage_cfg["steps"]
     start_time = time.time()
-    step = 0
-    for input_ids, labels, weight in loader:
-        step += 1
-        if step > stage_cfg["steps"]:
-            break
+    lengths, fingerprints = [], set()
+    for step in range(1, total_steps + 1):
+        if (step - 1) % len(loader) == 0:
+            train_ds.epoch = (step - 1) // len(loader)
+            if sampler is not None:
+                sampler.set_epoch(train_ds.epoch)
+            batches = iter(loader)
+        input_ids, labels, weight = next(batches)
+        for row, valid in zip(input_ids, labels.ne(-100)):
+            lengths.append(int(valid.sum()))
+            fingerprints.add(hashlib.blake2b(row[valid].numpy().tobytes(), digest_size=12).digest())
         input_ids, labels, weight = (input_ids.to(args.device), labels.to(args.device),
                                      weight.to(args.device))
         lr = get_lr(step, stage_cfg["steps"], args.learning_rate)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
+        window_start = (step - 1) // args.accumulation_steps * args.accumulation_steps
+        window_size = min(args.accumulation_steps, total_steps - window_start)
         with autocast_ctx:
             if lm_config.use_loop and args.loop_mode == "full_unroll":
-                res = model(input_ids, labels=None, collect_exits=True)
+                res = model(input_ids, labels=None, collect_exits=True, collect_routers=False)
                 exits = res.exit_logits
                 total = sum(weighted_ce(lg, labels, weight) for lg in exits) / len(exits)
-                loss = (total + res.aux_loss) / args.accumulation_steps
+                loss = (total + res.aux_loss) / window_size
             else:
                 r = max(1, args.fixed_loops)
-                res = model(input_ids, labels=None, num_loops=r)
+                res = model(input_ids, labels=None, num_loops=r, collect_routers=False)
                 total = weighted_ce(res.logits, labels, weight)
-                loss = (total + res.aux_loss) / args.accumulation_steps
+                loss = (total + res.aux_loss) / window_size
         scaler.scale(loss).backward()
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == total_steps:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -85,10 +97,22 @@ def train_stage(stage_idx, stage_cfg, epoch, iters, wandb=None):
                 wandb.log({"loss": total.item(), "stage": stage_idx,
                            "max_len": stage_cfg["max_len"], "learning_rate": lr})
         del input_ids, labels, weight, loss
+    shard_stats = [(lengths, fingerprints)]
+    if dist.is_initialized():
+        shard_stats = [None] * dist.get_world_size()
+        dist.all_gather_object(shard_stats, (lengths, fingerprints))
     if is_main_process():
+        lengths = sorted(n for ns, _ in shard_stats for n in ns)
+        unique = len(set.union(*(hs for _, hs in shard_stats)))
+        packing = dict(examples=len(lengths), valid_tokens=sum(lengths), min_length=lengths[0],
+                       median_length=lengths[len(lengths)//2], max_length=lengths[-1],
+                       duplicate_fraction=1 - unique / len(lengths))
+        Logger(f"Stage {stage_idx} packing {packing}")
         model.eval()
         save_x_checkpoint(model, args.save_dir, f'{args.save_weight}_stage{stage_idx}',
-                          lm_config.hidden_size)
+                          lm_config.hidden_size, extra={"packing": packing})
+        raw = getattr(model, "module", model)
+        raw.checkpoint_parent = raw.last_saved_checkpoint
         model.train()
 
 
@@ -122,14 +146,15 @@ if __name__ == "__main__":
     parser.add_argument("--needle_ratio", type=float, default=0.1, help="needle 样本混合比例")
     parser.add_argument("--needle_weight", type=float, default=5.0, help="gold token CE 加权")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl")
+    parser.add_argument("--tokenizer_path", default="../model")
     parser.add_argument('--from_weight', default='pretrain_x', type=str)
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-X-LongContext")
     parser.add_argument("--grad_ckpt", default=1, type=int, choices=[0, 1])
     args = parser.parse_args()
 
-    local_rank = init_distributed_mode()
-    if dist.is_initialized():
+    local_rank = init_distributed_mode(args.device)
+    if dist.is_initialized() and torch.device(args.device).type == "cuda":
         args.device = f"cuda:{local_rank}"
     setup_seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -146,11 +171,13 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=f"LongCtx-{args.stage_lens}")
 
     model, tokenizer = init_model_x(lm_config, args.from_weight,
-                                    save_dir=args.save_dir, device=args.device)
+                                    save_dir=args.save_dir, device=args.device, tokenizer_path=args.tokenizer_path)
+    lm_config = model.config
     if args.grad_ckpt == 1:
         set_gradient_checkpointing(model, True)
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False)
+        model = DistributedDataParallel(model, device_ids=[local_rank] if device_type == "cuda" else None, broadcast_buffers=False,
+                                        find_unused_parameters=True)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 

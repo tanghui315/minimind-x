@@ -3,9 +3,10 @@
 GRPO + Compute Penalty：
   R = R_task − λ_m·P_m − λ_r·P_r − λ_t·P_t
   R_task：math 正确性（safe_math_eval 判等）+ 轻量格式分
-  P_t = avg_loops/R_max（来自 generate 统计）；P_m/P_r 来自 controller 统计（如有）
+  P_t 使用实际循环深度，P_m 使用各轮读入的有效记忆 token，P_r 使用全局扫描和候选打分量。
 
-轨迹多样性：同一 prompt 的生成组按 [fast, normal, deep] 模式循环 → (memory, loop) 维度的组内对比。
+默认在无截断的温度 categorical 分布上采样 token，按合法动作分布采样 halt、检索与预算。
+有文档时由 controller 维护证据库和记忆。重放沿逐 token KV 历史复算相同事件及联合 logp。
 
 RL 三相课程（Doc 5 §24）：phase1 无 compute penalty → phase2 小 penalty → phase3 全额 Pareto。
 防塌缩（Doc 5 §25）：compute penalty 只在答案正确时生效 —— 简单题塌缩到 R=1 拿不到效率奖励。
@@ -18,7 +19,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datasets  # noqa: F401
 import argparse
-import math
+import json
 import random
 import re
 import time
@@ -32,6 +33,7 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
+from trainer.grpo_trajectory import trajectory, replay_logps
 from model.minimind_x import MiniMindXConfig
 from dataset.lm_dataset import AgentRLDataset
 from trainer.trainer_utils import (Logger, is_main_process, init_distributed_mode, setup_seed,
@@ -40,7 +42,6 @@ from trainer.x_utils import init_model_x, save_x_checkpoint, tokenize_tensors
 
 warnings.filterwarnings('ignore')
 
-MODE_CYCLE = ["fast", "normal", "deep"]
 PHASE_PENALTY = {1: (0.0, 0.0, 0.0), 2: (0.05, 0.05, 0.05), 3: (0.2, 0.1, 0.2)}  # (λ_m, λ_r, λ_t)
 
 
@@ -111,39 +112,33 @@ def format_reward(response):
 
 
 @torch.no_grad()
-def rollout_group(prompt_text, num_generations, max_new_tokens):
-    """一个 prompt 的生成组：按 [fast, normal, deep] 循环产生 (memory, loop) 多样性。
-
-    默认（on-policy，v1.2 修正）：每条轨迹固定采样 R（fast=1/normal=2/deep=R_max，
-    无 mode 多样性时随机 R∈[1,R_max]），生成与 logps 重算的计算路径严格一致。
-    --adaptive_rollout 1 为消融路径：adaptive halting 采样，轨迹内各 token 的 R 不同，
-    logps 只能用单一 R 近似重算（残余 off-policy 偏差），仅用于对比实验。
-    """
-    inputs = tokenize_tensors(tokenizer, prompt_text, args.device)
-    outs = {"ids": [], "completions": [], "loop": [], "mem": [], "ret": []}
+def rollout_group(prompt_text, num_generations, max_new_tokens, context=None, visibility=None):
+    inputs = tokenize_tensors(tokenizer, prompt_text, args.device)["input_ids"]
+    outs = {k: [] for k in ("ids", "completions", "loop", "mem", "ret", "records", "old_logps", "fixed_depth", "retrieval_cost")}
+    policy = getattr(model, "module", model)
     for j in range(num_generations):
-        mode = MODE_CYCLE[j % len(MODE_CYCLE)] if args.mode_diversity else None
-        if args.adaptive_rollout == 1:
-            res = model.generate(
-                inputs=inputs["input_ids"], attention_mask=inputs.get("attention_mask"),
-                max_new_tokens=max_new_tokens, do_sample=True, temperature=args.temperature,
-                eos_token_id=tokenizer.eos_token_id, mode=mode,
-                use_halting=True, return_stats=True)
-        else:
-            r = {"fast": 1, "normal": 2}.get(mode, lm_config.max_loop) if mode else \
-                random.randint(1, lm_config.max_loop)
-            r = max(1, min(r, lm_config.max_loop))
-            res = model.generate(
-                inputs=inputs["input_ids"], attention_mask=inputs.get("attention_mask"),
-                max_new_tokens=max_new_tokens, do_sample=True, temperature=args.temperature,
-                eos_token_id=tokenizer.eos_token_id, fixed_loops=r,
-                use_halting=False, return_stats=True)
-        gen_ids = res["generated_ids"][0, inputs["input_ids"].shape[1]:]
-        outs["ids"].append(gen_ids)
-        outs["completions"].append(tokenizer.decode(gen_ids.tolist(), skip_special_tokens=True))
-        outs["loop"].append(res["stats"]["avg_loops"])  # 固定 R 时严格 == r
-        outs["mem"].append(res["stats"].get("memory_steps", 0))
-        outs["ret"].append(res["stats"].get("re_retrievals", 0))
+        depth = None
+        if not args.adaptive_rollout:
+            depth = min((1, 2, lm_config.max_loop)[j % 3], lm_config.max_loop) if args.mode_diversity else random.randint(1, lm_config.max_loop)
+        records, old, reads, stats = trajectory(policy, inputs, context, max_new_tokens,
+                                                      args.temperature, tokenizer.eos_token_id, depth,
+                                                      visibility=visibility)
+        gen = inputs.new_tensor([r["token"] for r in records])
+        outs["ids"].append(gen)
+        outs["completions"].append(tokenizer.decode(gen.tolist(), skip_special_tokens=True))
+        outs["loop"].append(sum(r["depth"] for r in records) / len(records))
+        outs["mem"].append(reads)
+        outs["ret"].append(stats.get("retrievals", 0))
+        scan = stats.get("scanned_blocks", 0)
+        scored = stats.get("scored_blocks", 0)
+        # Dot products per hidden dimension: full index scan plus token-wise fine ranking.
+        work = scan + scored * lm_config.block_size
+        blocks = (context.numel() + lm_config.block_size - 1) // lm_config.block_size if context is not None else 0
+        full_search = blocks + min(blocks, lm_config.topk_coarse) * lm_config.block_size
+        outs["retrieval_cost"].append(work / max(1, len(records) * full_search))
+        outs["records"].append(records)
+        outs["old_logps"].append(old)
+        outs["fixed_depth"].append(depth)
     return outs
 
 
@@ -151,9 +146,9 @@ def compute_per_token_logps(model_, input_ids, n_keep, attention_mask=None, num_
     """num_loops 与轨迹实际轮数对齐（否则 off-policy 偏差：生成用自适应 R、评估用 R=1）。"""
     # 评审 8.2：梯度前向必须走 DDP 包装（unwrap 会丢梯度同步）
     # 推理/无梯度可用 raw；此处要 backward，故用 model_ 本身
-    target = model_ if isinstance(model_, DistributedDataParallel) else model_
+    target = model_
     logits = target(input_ids, attention_mask=attention_mask, num_loops=num_loops,
-                       logits_to_keep=n_keep + 1).logits[:, :-1, :]
+                       logits_to_keep=n_keep + 1, collect_routers=False).logits[:, :-1, :]
     logps = []
     for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
         logps.append(F.log_softmax(logits_row, dim=-1).gather(
@@ -167,47 +162,27 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
         prompts = [tokenizer.apply_chat_template(b["messages"], tokenize=False,
                                                  add_generation_prompt=True) for b in batch]
         gts = [b["gt"] for b in batch]
-        rollouts, old_logps, old_loop = [], [], []
-        prompt_lens = []
-        for p in prompts:
-            ro = rollout_group(p, args.num_generations, args.max_gen_len)
-            rollouts.append(ro)
-        # 拼 batch：每条轨迹独立（变长 → 逐条算 logps，研究级实现）
-        traj = []  # (prompt_idx, ids, stats)
-        prompt_base_ids = [tokenize_tensors(tokenizer, p, args.device)["input_ids"][0]
-                           for p in prompts]
-        for i, ro in enumerate(rollouts):
-            base = prompt_base_ids[i]
-            for j in range(args.num_generations):
-                # 评审 8.3：两侧先到 CPU 再 cat，避免 CUDA 跨设备
-                traj.append((i, torch.cat([base.cpu(), ro["ids"][j].cpu()]).to(args.device), ro))
-        old_per_token, logp_lens, traj_loops = [], [], []
-        with torch.no_grad():
-            for (i, ids, ro) in traj:
-                n_keep = ids.numel() - prompt_base_ids[i].numel()
-                j = len(old_per_token) % args.num_generations
-                # 评审 8.3/V2 §17.3：禁止平均深度重放（[1,3,2,4] 不得用 R=3 近似）
-                # adaptive 轨迹内 token 深度不同时，不得 int(round(avg_loops))
-                raw_loop = ro["loop"][j]
-                r = max(1, int(round(raw_loop)))
-                if abs(raw_loop - r) > 1e-6 and getattr(args, "allow_avg_depth_replay", 0) != 1:
-                    raise RuntimeError(
-                        f"禁平均深度重放：avg_loops={raw_loop} 非整数（V2 §17.3）。"
-                        f"请用固定 R rollout，或显式 --allow_avg_depth_replay 1（消融，不诚实）")
-                old_per_token.append(compute_per_token_logps(model, ids.unsqueeze(0), n_keep, num_loops=r)[0])
-                logp_lens.append(n_keep)
-                traj_loops.append(r)
+        from dataset.retrieval_qa_dataset import encode_evidence
+        contexts, visibility = [], []
+        for row in batch:
+            doc, _, rounds = encode_evidence(row, tokenizer, lm_config.block_size)
+            contexts.append(doc.to(args.device))
+            visibility.append(rounds.to(args.device))
+        rollouts = [rollout_group(p, args.num_generations, args.max_gen_len, doc, rounds)
+                    for p, doc, rounds in zip(prompts, contexts, visibility)]
+        prompt_ids = [tokenize_tensors(tokenizer, p, args.device)["input_ids"] for p in prompts]
+        traj = [(i, j, ro) for i, ro in enumerate(rollouts) for j in range(args.num_generations)]
 
         rewards = torch.zeros(len(traj), device=args.device)
         task_fn = code_task_reward if args.reward_type == "code" else math_task_reward
-        for k, (i, ids, ro) in enumerate(traj):
-            j = k % args.num_generations
-            task = task_fn(ro["completions"][j], gts[i]) + \
-                format_reward(ro["completions"][j])
+        for k, (i, j, ro) in enumerate(traj):
+            task_score = task_fn(ro["completions"][j], gts[i])
+            task = task_score + format_reward(ro["completions"][j])
             p_t = ro["loop"][j] / max(lm_config.max_loop, 1)
-            p_m = min(ro["mem"][j] / args.max_gen_len, 1.0)
-            p_r = ro["ret"][j] / 4.0
-            correct = task >= 1.0
+            query_tokens = prompt_ids[i].numel() + len(ro["records"][j]) - 1
+            p_m = ro["mem"][j] / (query_tokens * lm_config.max_loop * max(lm_config.memory_budgets))
+            p_r = ro["retrieval_cost"][j]
+            correct = task_score >= 1.0
             # 防塌缩：效率奖励只给「正确」的轨迹（Minimum reward constraint）
             penalty = (lam_m * p_m + lam_r * p_r + lam_t * p_t) if correct else 0.0
             rewards[k] = task - penalty
@@ -217,18 +192,33 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
         std_r = grouped.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)
         advantages = (rewards - mean_r) / (std_r + 1e-4)
 
+        if args.trajectory_log:
+            from pathlib import Path
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            path = Path(f"{args.trajectory_log}.rank{rank}.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                for k, (i, j, ro) in enumerate(traj):
+                    record = dict(epoch=epoch, step=step, phase=args.rl_phase, group=i, member=j,
+                                  temperature=args.temperature, fixed_depth=ro["fixed_depth"][j],
+                                  prompt_ids=prompt_ids[i][0].tolist(), context_tokens=contexts[i].numel(),
+                                  events_by_token=ro["records"][j], reward=rewards[k].item())
+                    stream.write(json.dumps(record) + "\n")
+
         # ---- 策略更新（逐轨迹累积，GRPO clip + KL）----
         optimizer.zero_grad(set_to_none=True)
         policy_loss_total, kl_total, n_traj = 0.0, 0.0, len(traj)
-        for k, (i, ids, ro) in enumerate(traj):
-            n_keep = logp_lens[k]
-            per_token_logps = compute_per_token_logps(model, ids.unsqueeze(0), n_keep,
-                                                      num_loops=traj_loops[k])[0]
+        for k, (i, j, ro) in enumerate(traj):
+            replay_args = (prompt_ids[i], contexts[i], ro["records"][j], args.temperature,
+                           ro["fixed_depth"][j], visibility[i])
+            per_token_logps = replay_logps(model, *replay_args, verify_behavior=True)
+            old = ro["old_logps"][j]
+            torch.testing.assert_close(per_token_logps.detach(), old, rtol=1e-5, atol=1e-5)
             with torch.no_grad():
-                ref_logps = compute_per_token_logps(ref_model, ids.unsqueeze(0), n_keep,
-                                                    num_loops=traj_loops[k])[0]
-            kl = torch.exp(ref_logps - per_token_logps) - (ref_logps - per_token_logps) - 1
-            ratio = torch.exp(per_token_logps - old_per_token[k].to(args.device))
+                ref_logps = replay_logps(ref_model, *replay_args)
+            delta = ref_logps - per_token_logps
+            kl = torch.expm1(delta) - delta
+            ratio = torch.exp(per_token_logps - old)
             clipped = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
             a1, a2 = ratio * advantages[k], clipped * advantages[k]
             token_loss = -(torch.min(a1, a2) - args.beta * kl).mean()
@@ -237,14 +227,25 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
             kl_total += kl.mean().item() / n_traj
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        if args.adaptive_rollout and lm_config.use_retrieval and not getattr(lm_config, "use_budget_router", False):
+            # A text-only RL stage must preserve an inherited fixed-budget baseline.
+            trained = any(contexts[i].numel() and grouped[i].max() > grouped[i].min()
+                          for i in range(len(contexts)))
+            flag = torch.tensor(int(trained), device=args.device)
+            if dist.is_initialized():
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            lm_config.use_budget_router = bool(flag.item())
 
+        evidence_reads = sum(sum(ro["mem"]) for ro in rollouts)
+        retrievals = sum(sum(ro["ret"]) for ro in rollouts)
         if step % args.log_interval == 0 or step == iters:
             acc = sum(1 for k, (i, _, ro) in enumerate(traj)
-                      if math_task_reward(ro["completions"][k % args.num_generations], gts[i]) >= 1.0) / len(traj)
+                      if task_fn(ro["completions"][k % args.num_generations], gts[i]) >= 1.0) / len(traj)
             avg_loop = sum(ro["loop"][k % args.num_generations] for k, (_, _, ro) in enumerate(traj)) / len(traj)
             Logger(f'GRPO-X Epoch:[{epoch + 1}]({step}/{iters}), reward: {rewards.mean().item():.4f}, '
                    f'acc: {acc:.3f}, avg_loop: {avg_loop:.2f}, KL: {kl_total:.4f}, '
-                   f'policy_loss: {policy_loss_total:.4f}, phase: {args.rl_phase}')
+                   f'policy_loss: {policy_loss_total:.4f}, memory_token_reads: {evidence_reads}, '
+                   f'retrievals: {retrievals}, phase: {args.rl_phase}')
             if wandb:
                 wandb.log({"reward": rewards.mean().item(), "accuracy": acc,
                            "avg_loops": avg_loop, "kl": kl_total,
@@ -253,14 +254,14 @@ def grpo_x_epoch(epoch, loader, iters, ref_model, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             save_x_checkpoint(model, args.save_dir, args.save_weight, lm_config.hidden_size)
-            model.train()
+            model.eval()
         del traj, rewards, advantages
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind-X Adaptive Compute GRPO")
     parser.add_argument("--save_dir", type=str, default="../out")
-    parser.add_argument('--save_weight', default='grpo_x', type=str)
+    parser.add_argument('--save_weight', default=None, type=str)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=2, help="每步 prompt 数")
     parser.add_argument("--learning_rate", type=float, default=3e-7)
@@ -268,6 +269,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--num_generations", type=int, default=3, help="每 prompt 轨迹数（3 的倍数配模式循环）")
     parser.add_argument("--max_gen_len", type=int, default=256)
+    parser.add_argument("--trajectory_log", help="Optional prefix for per-rank JSONL behavior traces")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--beta", type=float, default=0.05, help="KL 惩罚系数")
     parser.add_argument("--epsilon", type=float, default=0.2)
@@ -275,11 +277,8 @@ if __name__ == "__main__":
                         help="RL 课程：1 无惩罚 / 2 小惩罚 / 3 Pareto（Doc 5 §24）")
     parser.add_argument("--mode_diversity", default=1, type=int, choices=[0, 1],
                         help="轨迹按 fast/normal/deep 模式循环采样")
-    parser.add_argument("--allow_avg_depth_replay", default=0, type=int, choices=[0, 1],
-                        help="危险：允许平均深度近似重放（V2 §17.3 禁止；仅消融）")
-    parser.add_argument("--adaptive_rollout", default=0, type=int, choices=[0, 1],
-                        help="0=固定采样 R（默认，on-policy）；1=adaptive halting rollout"
-                             "（logps 用单一 R 近似，残余 off-policy 偏差，消融用）")
+    parser.add_argument("--adaptive_rollout", default=1, type=int, choices=[0, 1],
+                        help="1 samples and replays token/controller decisions; 0 fixes depth per trajectory")
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -294,17 +293,21 @@ if __name__ == "__main__":
                         help="math RL 数据：{conversations, gt}（官方 agent_rl_math.jsonl）")
     parser.add_argument("--reward_type", type=str, default="math", choices=["math", "code"],
                         help="math=safe_math_eval 判等；code=python 沙箱 stdout 匹配（T7.4）")
-    parser.add_argument('--from_weight', default='sft_x_c', type=str)
+    parser.add_argument('--from_weight', default=None, type=str)
     parser.add_argument("--tokenizer_path", type=str, default="../model",
                         help="tokenizer 目录（从仓库根目录运行时传 model/）")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-X-GRPO")
     args = parser.parse_args()
+    if args.from_weight is None:
+        args.from_weight = "sft_x_c" if args.rl_phase == 1 else f"grpo_x_phase{args.rl_phase - 1}"
+    if args.save_weight is None:
+        args.save_weight = f"grpo_x_phase{args.rl_phase}"
 
-    local_rank = init_distributed_mode()
-    if dist.is_initialized():
+    local_rank = init_distributed_mode(args.device)
+    if dist.is_initialized() and torch.device(args.device).type == "cuda":
         args.device = f"cuda:{local_rank}"
-    setup_seed(42)
+    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindXConfig(preset=args.preset, variant=args.variant, max_loop=args.max_loop,
                                 residual_v2=bool(args.residual_v2),
@@ -322,7 +325,8 @@ if __name__ == "__main__":
     model, tokenizer = init_model_x(lm_config, args.from_weight,
                                     tokenizer_path=args.tokenizer_path,
                                     save_dir=args.save_dir, device=args.device)
-    model.train()
+    lm_config = model.config
+    model.eval()  # Keep dropout identical in sampling and differentiable replay.
     ref_model, _ = init_model_x(lm_config, args.from_weight,
                                 tokenizer_path=args.tokenizer_path,
                                 save_dir=args.save_dir, device=args.device)
@@ -344,10 +348,10 @@ if __name__ == "__main__":
                         sampler=train_sampler, collate_fn=_collate)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank],
+        model = DistributedDataParallel(model, device_ids=[local_rank] if device_type == "cuda" else None,
                                         broadcast_buffers=False,
                                         find_unused_parameters=True)
-    iters = len(loader) * args.epochs
+    iters = len(loader)
     for epoch in range(args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         grpo_x_epoch(epoch, loader, iters, ref_model, 0, wandb)

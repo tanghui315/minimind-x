@@ -21,6 +21,7 @@ import torch
 
 from .retrieval.block_store import LongContextStore
 from .memory.working_memory import WorkingMemory, MemoryInput
+from .minimind_x import MiniMindXOutput
 from .router.retrieval_router import (
     ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH, ACTION_NAMES,
     action_mask, normalize_oracle_actions, ACTION_SCHEMA_VERSION)
@@ -28,8 +29,10 @@ from .router.retrieval_router import (
 
 
 class AdaptiveController:
-    def __init__(self, model):
+    def __init__(self, model, block_visible_from=None, fixed_budget_idx=None):
         """model: MiniMindXForCausalLM 或其 DDP 包装（须 use_retrieval/use_memory 打开）。"""
+        self.block_visible_from = block_visible_from
+        self.fixed_budget_idx = fixed_budget_idx
         self.model = model
         raw = model
         for attr in ("module", "_orig_mod"):
@@ -60,26 +63,26 @@ class AdaptiveController:
 
     # ---------------------------------------------------------------- 建库与初检
     def begin(self, context_ids):
-        self.store = LongContextStore(context_ids, self.cfg.block_size)
-        if self.store.n_blocks == 0:
-            # no_evidence 族：空库合法（G1/评审 6.3）——不建索引，检索将返回空 memory
-            self.store.block_keys = None
-        else:
-            self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
+        self.store = LongContextStore(context_ids, self.cfg.block_size, self.block_visible_from)
+        self.store.build_keys(self.raw.model.retriever, self.raw.model.embed_tokens)
+        self.store.set_manifest(tokenizer=getattr(self.raw.config, "tokenizer_identity", "pretokenized"),
+                                model_version=getattr(self.raw, "checkpoint_id", None) or self.cfg.architecture_version())
         self.memory = None
         self.stats = {"retrievals": 0, "memory_tokens": 0, "re_retrievals": 0,
                       "budget_cap_tokens": 0, "actual_valid_tokens": 0, "unique_blocks": 0,
                       "global_refresh": 0, "warm_rescore": 0, "reuse": 0}
         self.trajectory = []
         self.warm_candidates = None
-        self.stats["last_global_result"] = None
+        self.stats.update(last_global_result=None, scanned_blocks=0, scored_blocks=0)
         return self.store
 
     def _budget_idx(self, query_hidden, max_budget_tokens=None, teacher_idx=None):
         if teacher_idx is not None:
             return int(teacher_idx)
         router = self.raw.model.budget_router
-        if router is None:
+        if self.fixed_budget_idx is not None:
+            idx = self.fixed_budget_idx
+        elif router is None or not getattr(self.cfg, "use_budget_router", True):
             idx = self.cfg.default_budget_idx
         else:
             logits = router(query_hidden)
@@ -99,17 +102,16 @@ class AdaptiveController:
         budget_idx = self.cfg.default_budget_idx if budget_idx is None else budget_idx
         is_initial = mem is None
         budget_blocks = self.cfg.budget_blocks(budget_idx)
-        if self.store.n_blocks == 0 or self.store.block_keys is None:
+        if self.store.visible_count == 0 or self.store.block_keys is None:
             # 空库：合法 no-op memory（评审 6.3）
             mem = mem if mem is not None else WorkingMemory(
                 query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.block_size,
                                        self.cfg.hidden_size),
-                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
+                query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size),
+                metadata={"context_tokens": self.store.context_ids.numel()})
             self.stats["retrievals"] += 1
             self.stats["global_refresh"] = self.stats.get("global_refresh", 0) + 1
-            self.stats["memory_tokens"] = mem.token_size
-            self.stats["actual_valid_tokens"] = mem.token_size
-            self.stats["unique_blocks"] = 0
+            self._record_memory(mem)
             self.stats["budget_cap_tokens"] = self.cfg.memory_budgets[budget_idx]
             self.stats["last_result"] = None
             self.stats["last_global_result"] = None
@@ -124,6 +126,8 @@ class AdaptiveController:
         self.stats["retrievals"] += 1
         self.stats["global_refresh"] = self.stats.get("global_refresh", 0) + 1
         # T2.5：全局检索后刷新 Warm Candidate Cache（供 RESCORE_WARM 重排）
+        self.stats["scanned_blocks"] += self.store.n_blocks
+        self.stats["scored_blocks"] += result.cand_idx.numel()
         self.warm_candidates = {
             "cand_idx": result.cand_idx.detach() if result.cand_idx is not None else None,
             "cand_hidden": self.store.get_block_hidden(
@@ -137,29 +141,33 @@ class AdaptiveController:
         mem = mem if mem is not None else WorkingMemory(
             query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.block_size,
                                    self.cfg.hidden_size),
-            query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
+            query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size),
+            metadata={"context_tokens": self.store.context_ids.numel()})
         hit = torch.ones_like(result.block_idx, dtype=torch.float)  # 新块本轮均被使用
         mem, _, _ = self.raw.model.memory_manager.update(
             mem, result.block_hidden, block_keys, q_vec, budget_blocks, hit_new=hit,
             source_ids=result.block_idx)
-        self.stats["memory_tokens"] = mem.token_size
-        self.stats["actual_valid_tokens"] = mem.token_size
-        self.stats["unique_blocks"] = int(result.block_idx[:, 0].numel() and
-                                          torch.unique(result.block_idx.flatten()).numel())
+        self._record_memory(mem)
         self.stats["last_result"] = result
+        self.stats["last_global_query"] = None if is_initial else query_hidden
         self.stats["last_global_result"] = result  # distill/gold CE 用（warm rescore 不清除）
         # 事件记录口径：初始检索在此记录；轮间 refresh/reuse 由 loop_callback 记录（带轮次）
         if is_initial:
             self._trace("initial_retrieval",
                         budget_idx=budget_idx, cap_tokens=self.stats["budget_cap_tokens"],
-                        valid_tokens=mem.token_size, unique=self.stats["unique_blocks"])
+                        valid_tokens=self.stats["actual_valid_tokens"], unique=self.stats["unique_blocks"])
         return mem
+
+    def _record_memory(self, mem):
+        self.stats.update(context_tokens=self.store.context_ids.numel(), memory_tokens=mem.token_size,
+                          actual_valid_tokens=int(mem.token_valid().sum()),
+                          resident_source_ids=mem.source_ids[mem.valid].tolist(),
+                          unique_blocks=int(mem.source_ids[mem.valid].unique().numel()))
 
     def refresh_index(self, max_blocks=None):
         """P1：用当前 key_proj 重建库索引（Frozen Index 的周期 refresh）。
 
-        调用时机：step % key_refresh_interval == 0（训练器接线）。
-        重建后 memory/warm cache 不自动作废——若要严格一致应同时 bump memory_version。
+        仅用于持有同一 store 的调用方。请求级 SFT 每次建库，重建会清空已有记忆和候选。
         """
         if self.store is None:
             raise RuntimeError("refresh_index 需要已 begin() 的 store")
@@ -168,14 +176,9 @@ class AdaptiveController:
         # 索引指纹已变：warm 候选/last_global 基于旧 K，必须失效（防 stale 重排）
         self.warm_candidates = None
         self.stats["last_global_result"] = None
-        if self.memory is not None:
-            self.memory = self.memory.with_usage_bumped(
-                torch.zeros_like(self.memory.usage))  # 新对象 + version 不变但 KV 缓存失效
-            self.memory.invalidate_kv()
-        self.store.set_manifest(
-            model_version=getattr(self.cfg, "architecture_version", lambda: "minimind_x")()
-            if callable(getattr(self.cfg, "architecture_version", None))
-            else str(getattr(self.cfg, "architecture_version", "minimind_x")))
+        self.stats["last_result"] = None
+        self.memory = None
+        self.stats.update(memory_tokens=0, actual_valid_tokens=0, resident_source_ids=[], unique_blocks=0)
         self.stats["index_refreshes"] = self.stats.get("index_refreshes", 0) + 1
         return self.store.metadata
 
@@ -205,13 +208,14 @@ class AdaptiveController:
         budget_idx = self.cfg.default_budget_idx if budget_idx is None else budget_idx
         budget_blocks = self.cfg.budget_blocks(budget_idx)
         w = self.warm_candidates
+        self.stats["scored_blocks"] += w["cand_idx"].numel()
         cand_hidden = w["cand_hidden"]                          # [B,c,block,d]
         cand_idx = w["cand_idx"]                                # [B,c]
         q = self.raw.model.retriever.project_query(query_hidden).detach()
         # fine 重排：query 对候选块 token 级 max-sim（与 retrieve 的 fine 同口径）
         tok_sim = torch.einsum("bd,bckd->bck", torch.nn.functional.normalize(q, dim=-1),
                                torch.nn.functional.normalize(cand_hidden, dim=-1))
-        fine_scores = tok_sim.max(dim=-1).values                # [B,c]
+        fine_scores = tok_sim.masked_fill(~self.store.token_mask(cand_idx), -torch.inf).amax(-1)                # [B,c]
         topk_f = min(budget_blocks, fine_scores.shape[-1])
         k = fine_scores.topk(topk_f, dim=-1).indices
         final_idx = cand_idx.gather(1, k)
@@ -221,16 +225,15 @@ class AdaptiveController:
         mem = mem if mem is not None else WorkingMemory(
             query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.block_size,
                                    self.cfg.hidden_size),
-            query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size))
+            query_hidden.new_zeros(query_hidden.shape[0], 0, self.cfg.hidden_size),
+            metadata={"context_tokens": self.store.context_ids.numel()})
         hit = torch.ones_like(final_idx, dtype=torch.float)
         mem, _, _ = self.raw.model.memory_manager.update(
             mem, final_hidden, block_keys, q, budget_blocks, hit_new=hit,
             source_ids=final_idx)
         self.stats["retrievals"] += 1
         self.stats["warm_rescore"] = self.stats.get("warm_rescore", 0) + 1
-        self.stats["memory_tokens"] = mem.token_size
-        self.stats["actual_valid_tokens"] = mem.token_size
-        self.stats["unique_blocks"] = int(torch.unique(final_idx.flatten()).numel())
+        self._record_memory(mem)
         self.stats["budget_cap_tokens"] = self.cfg.memory_budgets[budget_idx]
         # 不覆盖 last_global_result（distill teacher 仍用最近全局检索的 fine_scores）
         return mem
@@ -299,6 +302,7 @@ class AdaptiveController:
             无 oracle 时用 RetrievalRouter.action_logits（RESCORE_WARM 无 warm cache 则 mask）。
             """
             vis = exit_hidden[:, :query_len] if query_len else exit_hidden
+            self.store.advance_round(r + 1)
             warm_ok = self.has_warm_cache()
             if oracle_retrieve is not None and r < len(oracle_retrieve):
                 action = int(oracle_retrieve[r])  # 已是 schema v2，禁止再映射
@@ -318,7 +322,7 @@ class AdaptiveController:
             ev = {ACTION_REUSE: "reuse", ACTION_RESCORE_WARM: "rescore_warm",
                   ACTION_GLOBAL_REFRESH: "refresh"}[action]
             self._trace(ev, round=r, action=action,
-                        action_logprob=a_logp, visible_prefix_len=query_len)
+                        action_logprob=a_logp, visible_prefix_len=query_len, warm_available=warm_ok)
             if action == ACTION_REUSE:
                 return None
             with torch.no_grad():
@@ -332,7 +336,7 @@ class AdaptiveController:
     # ---------------------------------------------------------------- 推理入口
     @torch.no_grad()
     def generate_with_context(self, input_ids, attention_mask=None, context_ids=None,
-                              mode=None, **gen_kwargs):
+                              mode=None, return_stats=True, **gen_kwargs):
         """终局生成（T6.3）：建库一次 → 因果初检 → generate（router 驱动轮间再检索）。
 
         推理期 input_ids 即完整可见 prompt，无需 query_len 边界。
@@ -344,13 +348,16 @@ class AdaptiveController:
         budget_idx = self._budget_idx(q_hidden, max_budget_tokens=caps.get("max_budget"))
         self.memory = self.retrieve_into_memory(q_hidden, budget_idx=budget_idx)
         cb = self.make_loop_callback(max_budget_tokens=caps.get("max_budget"))
-        out = self.model.generate(
+        out = self.raw.generate(
             inputs=input_ids, attention_mask=attention_mask, mode=mode,
             memory_provider=lambda step: self._memory_input(),
             loop_callback=cb, return_stats=True, **gen_kwargs)
         out["stats"].update({k: v for k, v in self.stats.items() if isinstance(v, (int, float))})
         out["stats"]["memory_tokens_final"] = self.memory.token_size if self.memory else 0
-        return out
+        out["stats"]["encoded_blocks"] = self.store.encoded_blocks
+        out["stats"]["indexed_blocks"] = self.store.n_blocks
+        out["stats"]["resident_source_ids"] = self.stats.get("resident_source_ids", [])
+        return out if return_stats else out["generated_ids"]
 
     @torch.no_grad()
     def _memory_input(self):
@@ -363,12 +370,16 @@ class AdaptiveController:
             valid = self.memory.token_valid()
             return MemoryInput(payload, valid,
                                memory_version=self.memory.memory_version)
+        if self.memory._kv_cache is None:
+            length = (self.stats["actual_valid_tokens"] if self.memory.hidden.size(0) == 1
+                      else self.memory.token_size * self.memory.hidden.size(0))
+            self.stats["legacy_projected_tokens"] = self.stats.get("legacy_projected_tokens", 0) + length
         return self.memory.get_kv(self.raw.model.thinking_core)
 
     # ---------------------------------------------------------------- 训练入口（SFT-C）
     def forward_with_oracles(self, input_ids, attention_mask, labels, context_ids,
                              gold_block_idx=None, oracle_retrieve=None, oracle_budget=None,
-                             oracle_r=None, distill=True, query_len=None):
+                             oracle_r=None, distill=True, query_len=None, append_only=False):
         """SFT-C / Stage 3 的 teacher-forced 终局训练前向（D5 + T0.1/T0.7）。
 
         query_len: 可见前缀边界（训练路径必填；初始检索与 gold CE 重算只用
@@ -385,8 +396,9 @@ class AdaptiveController:
             query_len = input_ids.shape[1]  # 纯推理/全可见
         causal_ids = input_ids[:, :query_len]
         self.begin(context_ids)
-        q_hidden = self.raw.model.prelude_hidden(causal_ids, attention_mask[:, :query_len]
-                                                 if attention_mask is not None else None)
+        query_mask = attention_mask[:, :query_len] if attention_mask is not None else None
+        q_hidden = self.raw.model.prelude_hidden(
+            causal_ids, query_mask, no_grad=gold_block_idx is None and not distill)
         budget_idx = self._budget_idx(q_hidden, teacher_idx=oracle_budget)
         with torch.no_grad():  # D5：memory 构建/选择路径不回传梯度
             self.memory = self.retrieve_into_memory(q_hidden, budget_idx=budget_idx)
@@ -398,12 +410,47 @@ class AdaptiveController:
             fwd["memory_payload"] = mem_input
         else:
             fwd["memory_kv_per_layer"] = mem_input
-        out = self.model(input_ids, attention_mask=attention_mask, labels=None, **fwd)
-        # T2.4：router_trace = 控制器轨迹（事件/动作/版本/exit）
-        try:
-            out.router_trace = list(self.trajectory)
-        except Exception:
-            pass
+        def retrieval_losses():
+            # Execute inside the same DDP forward as the supervised exits.
+            return self._retrieval_losses(q_hidden, gold_block_idx, distill)
+
+        if append_only:
+            # Prefill once. Each following teacher token sees the committed cache and current memory.
+            def execute(network, ids):
+                decode_cb = self.make_loop_callback()
+                past = None
+                exits = []
+                halt_steps = []
+                for start in [0, *range(query_len, ids.shape[1])]:
+                    end = query_len if start == 0 else start + 1
+                    chunk_mask = attention_mask[:, :end] if attention_mask is not None else None
+                    mem_key = "memory_payload" if self.cfg.residual_v2 else "memory_kv_per_layer"
+                    chunk = network(ids[:, start:end], attention_mask=chunk_mask, past_key_values=past,
+                                    use_cache=True, collect_exits=True,
+                                    loop_callback=cb if start == 0 else decode_cb,
+                                    **{mem_key: self._memory_input()})
+                    if start == 0:
+                        fields = vars(chunk).copy()
+                        # Bind gold CE and the fine teacher to the last question-only search.
+                        supervision = retrieval_losses()
+                    if chunk.router_probs and "halt" in chunk.router_probs:
+                        halt_steps.append(chunk.router_probs["halt"])
+                    past = chunk.past_key_values
+                    exits.append(chunk.exit_logits)
+                fields["exit_logits"] = [torch.cat(parts, dim=1) for parts in zip(*exits)]
+                fields["logits"] = fields["exit_logits"][-1]
+                fields["past_key_values"] = None
+                if halt_steps:
+                    # Column zero is the last prefill position; subsequent columns are decode steps.
+                    fields["router_probs"]["halt_by_step"] = [
+                        torch.stack(steps, dim=1) for steps in zip(*halt_steps)]
+                return fields, supervision
+            fields, supervision = self.model(input_ids, execution_fn=execute)
+        else:
+            fields, supervision = self.model(input_ids, attention_mask=attention_mask, labels=None,
+                                             retrieval_loss_fn=retrieval_losses, **fwd)
+        out = MiniMindXOutput(**fields)
+        out.router_trace = list(self.trajectory)
         extras = {"retrievals": self.stats["retrievals"],
                   "memory_tokens": self.memory.token_size,
                   "budget_cap_tokens": self.stats.get("budget_cap_tokens", 0),
@@ -413,27 +460,28 @@ class AdaptiveController:
                   "warm_available": self.has_warm_cache(),
                   "action_counts": {k: self.stats.get(k, 0) for k in
                                     ("reuse", "warm_rescore", "global_refresh")}}
-        result = self.stats.get("last_global_result") or self.stats.get("last_result")
+        extras.update(supervision)
         # ---- T2.5：全展开时收集三动作 logits（用于 action CE）----
         if getattr(out, "router_probs", None) and out.router_probs.get("retrieval_action") is not None:
             extras["retrieval_action_logits"] = out.router_probs["retrieval_action"]
             extras["retrieval_action_masks"] = out.router_probs.get("retrieval_action_mask")
-        # ---- T0.7：监督项用 grad mode 重算的 logits（离散选择仍 no_grad）----
-        zero = None
-        # 空库（no_evidence）：无检索监督可算
-        if (gold_block_idx is not None or distill) and self.store.n_blocks > 0:
-            q_grad = self.raw.model.prelude_hidden(
-                causal_ids, attention_mask[:, :query_len]
-                if attention_mask is not None else None, no_grad=False)
-            q_vec = self.raw.model.retriever.project_query(q_grad)
-            coarse_trainable = self.raw.model.retriever.coarse_scores(q_vec, self.store)
-            zero = q_vec.new_zeros(())
-            if gold_block_idx is not None and result is not None:
-                n_blocks = result.coarse_scores.shape[-1]
-                if (gold_block_idx >= 0).all() and (gold_block_idx < n_blocks).all():
-                    extras["retrieval_ce"] = self.raw.model.retriever.retrieval_ce_loss(
-                        coarse_trainable, gold_block_idx)
-            if distill and result is not None and result.fine_scores is not None:
-                extras["distill_loss"] = self.raw.model.retriever.distill_loss(
-                    coarse_trainable, result.cand_idx, result.fine_scores)
         return out, extras
+
+    def _retrieval_losses(self, initial_query, gold_block_idx, distill):
+        result = self.stats.get("last_global_result")
+        losses = {}
+        if result is None or (gold_block_idx is None and not distill):
+            return losses
+        hidden = self.stats.get("last_global_query")
+        if hidden is None:
+            hidden = initial_query
+        retriever = self.raw.model.retriever
+        coarse = retriever.coarse_scores(retriever.project_query(hidden), self.store)
+        if gold_block_idx is not None and ((gold_block_idx >= 0) & (gold_block_idx < coarse.size(1))).all():
+            visible = result.coarse_scores.isfinite()
+            if visible.gather(1, gold_block_idx.view(-1, 1)).all():
+                losses["retrieval_ce"] = retriever.retrieval_ce_loss(coarse.masked_fill(~visible, -torch.inf),
+                                                                     gold_block_idx)
+        if distill and result.fine_scores is not None:
+            losses["distill_loss"] = retriever.distill_loss(coarse, result.cand_idx, result.fine_scores)
+        return losses

@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import apply_lora, load_lora
+from trainer.x_utils import tokenize_tensors
 
 warnings.filterwarnings('ignore')
 
@@ -27,6 +28,15 @@ app = FastAPI()
 
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    if getattr(args, "x_checkpoint", None):
+        from trainer.x_utils import bind_x_tokenizer, load_x_for_eval
+        if args.lora_weight != 'None':
+            raise ValueError("--x_checkpoint expects merged X weights")
+        model = load_x_for_eval(args.save_dir, args.x_checkpoint, device=device)
+        bind_x_tokenizer(model, tokenizer)
+        if torch.device(device).type == "cuda":
+            model.half()
+        return model, tokenizer
     if 'model' in args.load_from:
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
@@ -105,7 +115,7 @@ def parse_response(text):
 def generate_stream_response(messages, temperature, top_p, max_tokens, tools=None, open_thinking=False):
     try:
         new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None, open_thinking=open_thinking)
-        inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
+        inputs = tokenize_tensors(tokenizer, new_prompt, device, truncation=True)
 
         queue = Queue()
         streamer = CustomStreamer(tokenizer, queue)
@@ -113,12 +123,12 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
         def _generate():
             try:
                 model.generate(
-                    inputs.input_ids,
+                    inputs["input_ids"],
                     max_new_tokens=max_tokens,
                     do_sample=True,
                     temperature=temperature,
                     top_p=top_p,
-                    attention_mask=inputs.attention_mask,
+                    attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     streamer=streamer
@@ -198,11 +208,11 @@ async def chat_completions(request: ChatRequest):
                 tools=request.tools or None,
                 open_thinking=request.get_open_thinking()
             )
-            inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
+            inputs = tokenize_tensors(tokenizer, new_prompt, device, truncation=True)
             with torch.no_grad():
                 generated_ids = model.generate(
                     inputs["input_ids"],
-                    max_length=inputs["input_ids"].shape[1] + request.max_tokens,
+                    max_new_tokens=request.max_tokens,
                     do_sample=True,
                     attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
@@ -210,7 +220,7 @@ async def chat_completions(request: ChatRequest):
                     top_p=request.top_p,
                     temperature=request.temperature
                 )
-                answer = tokenizer.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                answer = tokenizer.decode(generated_ids[0, inputs["input_ids"].shape[1]:].tolist(), skip_special_tokens=True)
             content, reasoning_content, tool_calls = parse_response(answer)
             message = {"role": "assistant", "content": content}
             if reasoning_content:
@@ -236,6 +246,7 @@ async def chat_completions(request: ChatRequest):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Server for MiniMind")
+    parser.add_argument('--x_checkpoint', help='MiniMind-X checkpoint file; --load_from supplies its tokenizer')
     parser.add_argument('--load_from', default='../model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, dpo, reason, ppo_actor, grpo, spo）")

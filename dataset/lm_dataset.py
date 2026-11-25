@@ -249,7 +249,7 @@ class AgentRLDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         messages, tools = self.parse_conversations(sample['conversations'])
-        return {'messages': messages, 'tools': tools, 'gt': sample['gt']}
+        return {**sample, 'messages': messages, 'tools': tools, 'gt': sample['gt']}
 
 
 if __name__ == "__main__":

@@ -1,16 +1,12 @@
-"""P3 消融：Frozen Key vs Periodic Refresh vs（可选）联训预备。
+"""Compare a stale index and periodic rebuilds under identical seeded embedding perturbations.
 
-对比三组（同数据/同步数）：
-  A freeze_forever     key_refresh_interval=0
-  B refresh_every_N    key_refresh_interval=N
-  C refresh_adaptive   N 较大 + 监控 recall 漂移（简化：仍按步数）
-
-输出：Recall@1/@8 与（若有 QA 标签）answer match，写 jsonl。
-不启动长训——用小模型 + 合成 evidence 作冒烟/趋势观察。
+Reports coarse recall, RMS key drift relative to a fresh index, and measured rebuild time.
 """
 import os
 import sys
 import json
+import copy
+import time
 import argparse
 import torch
 
@@ -18,7 +14,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
 from model.minimind_x.controller import AdaptiveController
-from model.minimind_x.retrieval import LongContextStore
 
 
 def recall_at_k(store, model, queries, gold_blocks, ks=(1, 8)):
@@ -41,20 +36,26 @@ def recall_at_k(store, model, queries, gold_blocks, ks=(1, 8)):
 
 
 def run_arm(name, refresh_interval, model, ctx, gold_blocks, query_hiddens, steps=3):
+    model = copy.deepcopy(model)
+    model.config.key_refresh_interval = refresh_interval
     ctrl = AdaptiveController(model)
-    # 按 arm 覆盖 interval（勿用全局 cfg 串味）
-    prev = getattr(model.config, "key_refresh_interval", 0)
-    model.config.key_refresh_interval = int(refresh_interval)
-    try:
-        ctrl.begin(ctx)
-        if refresh_interval > 0:
-            for s in range(1, steps + 1):
-                ctrl.maybe_refresh_index(s * max(1, refresh_interval))
-        else:
-            ctrl.maybe_refresh_index(1)  # interval=0 → 不 refresh
-    finally:
-        model.config.key_refresh_interval = prev
+    ctrl.begin(ctx)
+    # Identical deterministic embedding drift in both arms. The index remains request-local in training.
+    rng = torch.Generator(device=ctx.device).manual_seed(73)
+    elapsed = 0.0
+    for step in range(1, steps + 1):
+        with torch.no_grad():
+            weight = model.model.embed_tokens.weight
+            weight.add_(torch.randn(weight.shape, generator=rng, device=weight.device) * .01)
+        start = time.perf_counter()
+        if ctrl.maybe_refresh_index(step):
+            elapsed += time.perf_counter() - start
+    fresh = AdaptiveController(model)
+    fresh.begin(ctx)
     r = recall_at_k(ctrl.store, model, query_hiddens, gold_blocks)
+    r["key_rms_drift"] = float((fresh.store.block_keys - ctrl.store.block_keys).square().mean().sqrt())
+    r["rebuild_seconds"] = elapsed
+    r["drift_source"] = "seeded_embedding_perturbation"
     r["arm"] = name
     r["key_refresh_interval"] = refresh_interval
     r["index_manifest"] = ctrl.store.metadata

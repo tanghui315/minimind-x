@@ -54,62 +54,53 @@ class LongContextPretrainDataset(Dataset):
     """打包式长上下文预训练数据（stage A–C：8K→128K 全量 attention 主干）。"""
 
     def __init__(self, data_path, tokenizer, max_length=8192, needle_ratio=0.1,
-                 needle_weight=5.0, seed=42):
+                 needle_weight=5.0, seed=42, min_chunks=1):
+        from array import array
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.needle_ratio = needle_ratio
         self.needle_weight = needle_weight
-        self.rng = random.Random(seed)
-        self.samples = self._load(data_path)
-
-    def _load(self, data_path):
-        if not os.path.exists(data_path):
-            return []
-        texts = []
-        with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    item = json.loads(line)
-                    texts.append(item["text"])
-        return texts
+        self.seed = seed
+        self.epoch = 0
+        # A compact contiguous stream preserves long document tails and document boundaries.
+        self.tokens = array("I")
+        with open(data_path, encoding="utf-8") as source:
+            for line in source:
+                if line.strip():
+                    ids = tokenizer(json.loads(line)["text"], add_special_tokens=False).input_ids
+                    self.tokens.extend([tokenizer.bos_token_id, *ids, tokenizer.eos_token_id])
+        self.chunk_size = min(max_length, len(self.tokens) // min_chunks)
+        if self.chunk_size < 2:
+            raise ValueError("Too few corpus tokens for one training example per rank")
 
     def __len__(self):
-        # 打包后 chunk 数 ≈ 总 token / max_length；needle 混合不改变量纲
-        return max(1, len(self.samples))
-
-    def _pack_chunk(self):
-        """随机取文档拼满一个 max_length chunk；按概率混入 needle 样本并标 gold 权重。"""
-        use_needle = self.rng.random() < self.needle_ratio
-        if use_needle:
-            text, needle = synth_needle_text(self.max_length - 8, rng=self.rng)
-            gold_text = needle
-        else:
-            text = self.rng.choice(self.samples) if self.samples else \
-                "".join(self.rng.choice(FILLER_WORDS) for _ in range(64)) + "。"
-            gold_text = None
-        tokens = self.tokenizer(text, add_special_tokens=False,
-                                max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
-        input_ids = torch.tensor(input_ids[:self.max_length], dtype=torch.long)
-        labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
-        weight = torch.ones(self.max_length)
-        if gold_text is not None:
-            gold_ids = self.tokenizer(gold_text, add_special_tokens=False).input_ids
-            n = len(gold_ids)
-            needle_tok = torch.tensor(gold_ids, dtype=torch.long)
-            window = input_ids.unfold(0, n, 1)
-            match = (window == needle_tok).all(dim=1)
-            idx = match.nonzero().flatten()
-            if len(idx):
-                for i in idx.tolist():
-                    weight[i:i + n] = self.needle_weight  # L_retrieval-aware：gold 加权
-        return input_ids, labels, weight
+        return (len(self.tokens) + self.chunk_size - 1) // self.chunk_size
 
     def __getitem__(self, index):
-        return self._pack_chunk()
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        rng = random.Random(self.seed + index + self.epoch * len(self))
+        start = index * self.chunk_size
+        ids = list(self.tokens[start:start + self.chunk_size])
+        weight = torch.ones(self.max_length)
+        if rng.random() < self.needle_ratio:
+            from scripts.data_gen.gen_needle import gen_sample
+            from dataset.retrieval_qa_dataset import token_span
+            # Leave room for the question and supervised answer at the end.
+            sample = gen_sample(rng, self.max_length - 32, [rng.random()], 1, 256, self.tokenizer)
+            enc = self.tokenizer(sample["context"], add_special_tokens=False, return_offsets_mapping=True)
+            first, last = token_span(enc.offset_mapping, sample["gold_span"])
+            suffix = self.tokenizer(sample["question"] + sample["answer"], add_special_tokens=False).input_ids
+            ids = [self.tokenizer.bos_token_id, *enc.input_ids, *suffix, self.tokenizer.eos_token_id]
+            if len(ids) > self.max_length:
+                raise ValueError("Needle question exceeds the reserved space")
+            weight[first + 1:last + 1] = self.needle_weight
+            weight[len(enc.input_ids) + 1:len(ids)] = self.needle_weight
+        x = torch.full((self.max_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+        x[:len(ids)] = torch.tensor(ids)
+        labels = x.clone()
+        labels[len(ids):] = -100
+        return x, labels, weight
 
 
 def collate_long_context(batch):

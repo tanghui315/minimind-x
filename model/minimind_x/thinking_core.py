@@ -237,7 +237,7 @@ class ThinkingCore(nn.Module):
     def forward(self, hidden_states, position_embeddings, past_key_values=None,
                 use_cache=False, attention_mask=None, memory_kv_per_layer=None,
                 num_loops=1, halt_fn=None, halt_threshold=0.5, loop_callback=None,
-                anchor=None, memory_payload=None):
+                anchor=None, memory_payload=None, visible_len=None, router_mask=None, prefix=None):
         """循环执行（V2 §12.4 顺序：MHAR → Core(首层 Reader) → Update 提交 → Halt）。
 
         参数：
@@ -266,7 +266,27 @@ class ThinkingCore(nn.Module):
             bsz = hidden_states.shape[0]
             halted = torch.zeros(bsz, dtype=torch.bool, device=hidden_states.device)
             exit_idx = torch.full((bsz,), -1, dtype=torch.long, device=hidden_states.device)
-        for r in range(num_loops):
+        def visible_mean(values):
+            values = values[:, :visible_len]
+            if router_mask is None:
+                return values.mean(dim=1)
+            return (values * router_mask).sum(dim=1) / router_mask.sum(dim=1).clamp_min(1)
+
+        if prefix is not None:
+            # A branch owns its lists. KV tensors and committed states are append-only.
+            exit_hiddens = list(prefix.core["exit_hiddens"])
+            committed_states = list(exit_hiddens)
+            presents_per_pass = list(prefix.core["presents_per_pass"])
+            residual_stats_per_round = list(prefix.core["residual_stats"])
+            memory_versions = list(prefix.core["memory_versions"])
+            self._reader_kv, self._reader_kv_ver = prefix.reader_cache
+            previous = hidden_states = exit_hiddens[-1]
+            if self.residual_v2:
+                history = [anchor, *exit_hiddens]
+            if num_loops < len(exit_hiddens):
+                raise ValueError("Cannot resume before the captured round")
+
+        for r in range(len(exit_hiddens), num_loops):
             if loop_callback is not None and r > 0:
                 new_state = loop_callback(r - 1, exit_hiddens[-1])
                 if new_state is not None:
@@ -294,9 +314,9 @@ class ThinkingCore(nn.Module):
                 committed = candidate + lam * (gated - candidate)
                 # T2.1 / V2 §7.5：halt 用 detached 门控统计（不把 gate 路径绑进 halt 梯度）
                 with torch.no_grad():
-                    gbar = gate.float().mean(dim=(1, 2))                     # [B] ḡ
-                    d_cand = (candidate.float() - previous.float()).norm(dim=-1).mean(dim=-1)
-                    d_commit = (committed.float() - previous.float()).norm(dim=-1).mean(dim=-1)
+                    gbar = visible_mean(gate.float().mean(dim=-1))
+                    d_cand = visible_mean((candidate.float() - previous.float()).norm(dim=-1))
+                    d_commit = visible_mean((committed.float() - previous.float()).norm(dim=-1))
                 residual_stats_r = {"gate_mean": gbar.detach(),
                                     "delta_cand": d_cand.detach(),
                                     "delta_commit": d_commit.detach()}

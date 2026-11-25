@@ -129,7 +129,7 @@ baseline 保留原教旨实现。
 
 ```bash
 # Stage 0 基础预训练（routers 关闭；--loop_mode random 为 Doc 3 Phase0 消融）
-# 唯一命令源：scripts/run_stage0.sh（batch/LR/workers 可参数覆盖，D11 吞吐方案由此生效）
+# 统一参数源：scripts/launch_h20_8card.sh pretrain（batch/LR/workers 可参数覆盖，D11 吞吐方案由此生效）
 bash scripts/launch_h20_8card.sh pretrain        # 或 ./scripts/run_stage0.sh --epochs 2
 
 # Stage 1 长上下文课程（A–C：8K→32K→128K，默认 dense；D/E 512K/1M 走稀疏路径=eval_needle retrieval）
@@ -148,9 +148,7 @@ bash scripts/launch_h20_8card.sh grpo1 && bash scripts/launch_h20_8card.sh grpo2
 数据：`scripts/data_gen/*` 产 needle / long_dep / multihop / repo / memory_mgmt jsonl；
 SFT 混合配比用 `dataset/mix_dataset.py::MixedSFTDataset`（默认 30/25/20/15/10）。
 
-Oracle 标签（Doc 4 §3 self-generated supervision）：`trainer/oracle_labels.py` 提供
-`sweep_depth`（在线 R*）、`sweep_budget`（B*）、`sweep_retrieval`（retrieve 标签），
-SFT-C 以 `--oracle_rate` 小采样率在线生成（D5 teacher-forcing）。
+SFT-C 按 `--oracle_rate` 抽样生成在线标签。深度 R* 使用当前 teacher-forcing 前向的逐位置出口损失，预算 B* 和轮间检索动作分别使用 `sweep_budget` 和 `sweep_retrieval_action`。
 
 ---
 
@@ -223,7 +221,7 @@ attn 全 full；F 单 router=train_halt/retrieval/budget_router 开关。
 | # | 问题 | 修正 |
 |-|-|-|
 | 1 | **Budget Oracle 随机标签（真 bug）**：train_sft_x 用 `randint` 当 B* | 接线 `sweep_budget`（逐档 loss → B\*），与 oracle_rate 同门控；未采到标签的批次不监督（router 仍按自身 argmax 执行） |
-| 2 | **GRPO off-policy 残余**：`round(avg_loops)` 把轨迹内各 token 不同的 R 压成单值 | 默认改为固定采样 R（fast=1/normal=2/deep=R_max），生成与 logps 重算路径严格一致（on-policy）；`--adaptive_rollout 1` 保留旧行为供消融 |
+| 2 | **GRPO off-policy 残余**：`round(avg_loops)` 把轨迹内各 token 不同的 R 压成单值 | 当前实现逐 token 重放实际采样的停机、检索、预算和 token 动作。`--adaptive_rollout 0` 可固定深度 |
 | 3 | **检索标签 batch 级且无 correctness 分量** | `sweep_retrieval` 升级为 per-sample [B,R] 标签：ΔCE>ε **或** correctness 增益（with 对 without 错）即点亮 |
 | 4 | **测试偏接口、缺能力验证与 MRR** | 新增 tests/test_learnability.py（loop 路径/记忆路径过拟合 + 循环区参数确被更新 + loop_embedding 消融可训）；检索测试补 MRR |
 | 5 | **定位表述** | 见本文开头「定位表述」：externalized working memory，非全注意力 1M context |
@@ -272,7 +270,7 @@ P1-4 公开基准（Phase 1 实验工作，非代码缺陷）。**结论：代�
 1. **resume 记账（重要）**：保存语义改为「下一待跑位置」；配置守卫（world_size/batch 变化 →
    当前 epoch 从头）；删除 trainer_utils 跨卡 step 翻倍换算。三场景端到端验证
    （同配置续跑/跨配置从头/已完成退出）。
-2. **命令同源**：scripts/run_stage0.sh 为 Stage-0 唯一命令源（night_runner/看门狗/冒烟共用）。
+2. **命令同源**：scripts/run_stage0.sh 调用同一个 Stage-0 启动入口（night_runner/看门狗/冒烟共用）。
 3. **路径锚定**：CKPT_DIR 锚定仓库根绝对路径；SFT/GRPO 补 --tokenizer_path；SFT 加 --max_steps。
 4. **夜间运维模式**：21:00 自动启动器（含完整停服序列：vllm-watchdog→容器→清泄漏 worker→等显存
    释放）+ stage0 窗口看门狗 + 早 8 点自动恢复与 morning_report.txt。可复用于后续每夜训练。
@@ -287,3 +285,51 @@ P1-4 公开基准（Phase 1 实验工作，非代码缺陷）。**结论：代�
 
 6400 词表实测 fertility（中文叙事 0.95 / 数字 1.36 字符每 token，数字逐位碎片）。验证期保持不动
 （架构结论为内部对比）；preset M 重训时与 D10 一并做 32k A/B。详见任务清单 §7.7。
+
+## 训练阶段继承与端到端回归（2026-11-24）
+
+从仓库根目录使用 `scripts/launch_h20_8card.sh` 时，默认权重链为：
+
+```text
+pretrain_x → longctx_x_stage0 → longctx_x_stage1 → longctx_x_stage2
+           → sft_x_a → sft_x_b → sft_x_c
+           → grpo_x_phase1 → grpo_x_phase2 → grpo_x_phase3
+```
+
+长上下文三个阶段在同一进程中连续更新，逐阶段保存。若自定义阶段数或省略长上下文训练，给 `sft_a` 传 `--from_weight` 指向实际父权重。启动器默认使用 M 规模；小模型测试可设 `MMX_PRESET=""` 并传 `--hidden_size` 和 `--num_hidden_layers`。在预训练时传 `--residual_v2 1` 即可生成 V2 checkpoint。后续评测从 checkpoint 恢复完整配置，并严格核对参数。服务可用 `--x_checkpoint <权重文件> --load_from <tokenizer目录>` 加载 X 模型。
+
+SFT-C 对混合 JSONL 只读取 train；无 split 的既有训练文件按 train 处理。生成七族证据数据时，train 和 val 使用互斥部署组，并输出实际组数及交集。新证据按当前 tokenizer 的字符 offsets 定位，跨块的证据在所有相关块上执行轮次约束。带上下文的 Needle 评测对声明了 split 的数据读取 val，无声明的独立评测文件可直接使用。
+
+```bash
+python -m pytest -q tests/test_x_p0_regressions.py tests/test_x_training_pipeline.py
+```
+
+第一组覆盖双进程 CPU/Gloo 的检索梯度同步、因果性、数据和权重契约，以及服务请求。第二组使用临时数据运行实际训练、加载、评测和带文档推理入口。小规模验证的评测数值只用于检查计算和数据流。
+
+### P1 训练和测量口径
+
+- 两个 Stage-0 启动入口共享同一组默认配置。新 checkpoint 的元数据保存本次 ID、输出路径、父 checkpoint 的路径和 ID。长上下文按带 BOS/EOS 的连续 token 流分块，分布式 sampler 按索引分片。阶段保存实际有效长度和内容重复率。短语料达到指定步数时会重新遍历，重复部分计入统计。
+- SFT-C 在监督预算头关闭时使用配置中的固定预算。开启监督后使用显式预算标签或预测结果。外部资料只受 `--max_context_tokens` 限制。checkpoint 的 `evidence_metrics.depth_unit=next_token_decisions` 表示深度评估数和各预算档未解决数均按预测位置统计。证据截断仍按样本计数。
+- SFT-C 先预填问题，再按可见 token 追加缓存，用任务记忆计算逐出口损失。轮间动作有 R−1 个决策点。初始问题的 oracle 动作仅作用于预填阶段，后续解码使用当时可见的状态。检索 CE 和蒸馏取问题预填内最后一次全局检索的查询、可见块及候选。
+- 默认固定深度预填时，停机监督从解码开始。每个有下一 token 标签的位置，在本位置各轮 CE 中取落入最优值 + ε 的最早出口。若各轮都预测错误，该位置跳过停机 BCE。预测 EOS 的位置参与监督。文件显式给出的 `oracle_r` 作为该样本各有效位置的深度标签。
+- GRPO 默认采样联合动作。token 使用温度缩放后的全词表 categorical，停机使用 Bernoulli，检索和预算使用合法档位的 categorical。首轮预填遵从模型 prefill 策略，最大深度强制退出。训练对行为策略逐事件校验所选动作概率、实际深度和证据来源，在同一条事件序列上计算冻结参考策略的概率。JSONL 可通过 `--trajectory_log PREFIX` 按 rank 保存。`--adaptive_rollout 0` 可用于固定深度对照。无文档的 RL 样本仅触发 token 和深度路径。
+- 索引按请求构建。manifest 标识 embedding 与 key 投影的联合指纹、tokenizer 和模型。显式刷新会清空候选、已编码块、工作记忆。尾块的有效 token 掩码参与粗排、全局/缓存精排及 V2 Reader。生成统计分别给出原始资料长度、实际有效 token、槽容量和最终来源 ID。
+- `eval_suite.py --profile_context 文档路径` 单独测一次冷请求，记录索引、候选编码、Reader 调用及估算开销、TTFT、TPOT 和 profiler 支持的算子 FLOPs。CUDA 设备额外记录峰值分配字节。常规吞吐在独立运行中测量。local/sparse 参考实现仍按物理 dense score 尺寸估算。
+- Needle 对整条规范化答案做精确匹配，数据模式评全部验证样本。按任务族、实际长度区间和证据深度分层。深度评测记录每个固定 R 的正确数、可解题数、路由正确率，以及在相同答案前缀与历史缓存下逐 token 最早正确出口的命中数。
+
+新增回归见 `tests/test_x_p1_regressions.py`，阶段继承和实际 CLI 验收见 `tests/test_x_training_pipeline.py`。
+
+### 四动作反事实评测
+
+从仓库根目录运行以下入口。输入 JSONL 沿用检索 QA 的 question、context、answer 和可选 gold_span、split、family、deployment_id。带 split 的记录只取 val，无 split 的文件视作独立验证集。
+
+```bash
+python scripts/eval_counterfactual.py --checkpoint "$CHECKPOINT" --data "$VALIDATION_JSONL" \
+  --out "$REPORT_JSON" --device cuda --round 1 --cache both --max-new-tokens 48 --repeats 5
+```
+
+问题先按 SFT 格式预填，随后追加已知的“答案：”。在最后一个分隔符 token 完成第 r 轮 Core 后、进入 Coda 前保存状态。快照包含 Prelude、已经提交的 hidden 和历史轮次 KV、Reader 投影、请求级检索缓存、工作记忆与可见轮次。各分支沿用相同的历史，STOP 直接进入 Coda，其余动作执行下一轮，后续决策交还原控制器。没有暖候选时屏蔽重排，达到最大轮数时只评 STOP。选择 r>1 会强制共享前缀到达该深度，因此所得上界条件于这一决策点。当前评测粒度是每题首个答案 token 的一次决策。
+
+分支报告记录参考答案逐 token log-prob（不含 EOS）、自由贪心生成的整答精确匹配、证据 ID、各次决策用时和完整生成用时。延迟在请求状态复制后起表，CUDA 在计时边界同步。request 保留请求当时的已编码块缓存，cold 清空这些缓存，同时保留合法暖候选及已建索引。每臂先预热，测量顺序按样本和重复次数打乱。GPU 计时应对照同型号设备与相同负载。
+
+逐题 oracle 使用验证答案挑选动作。相同延迟预算按每题每臂实测的生成耗时中位数求和，EM 上界通过最便宜的正确升级计算，平均参考 log-prob 上界以多选背包整数优化计算。另从问题预填开始整题运行现有路由、所有固定深度和仅初检策略，完整请求与局部分支有独立的计时起点。报告同时按任务族和决策时标注证据的位置分组。多跳样本的单个 gold_span 只标识其中一个事实。

@@ -10,7 +10,7 @@
   insufficient     确实缺少必要字段 —— 允许承认不足而非强行回答
 
 机制验收（V2 §16.2 随机事实任务）：evidence_needed/new_evidence 每条随机换外部事实，
-train/val 用不同随机种子（事实组合不重叠）；交换/移除 memory 后答案应随之变化。
+train/val 使用互斥部署组；交换/移除 memory 后答案应随之变化。
 
 输出 jsonl：{context, question, answer, family, gold_block, gold_span, split}
 gold_span: 证据句在 context 中的 [start, end) 字符偏移；token id 标注由 dataset 按
@@ -50,8 +50,8 @@ def _block_ctx(rng, facts, n_blocks=6, gold_ratio=0.5):
     return ctx, gold_idx, span
 
 
-def gen_sample(rng, family):
-    dev = rng.choice(DEVICES)
+def gen_sample(rng, family, devices=DEVICES):
+    dev = rng.choice(devices)
     ver, ver_wrong = rng.sample(VERSIONS, 2)
     val = rng.randint(1000, 9999)
     if family == "no_evidence":
@@ -66,7 +66,7 @@ def gen_sample(rng, family):
                 "answer": str(val), "gold_block": gold, "gold_span": span}
     if family == "irrelevant":
         # 真值修正：干扰设备必须 ≠ 目标设备，且 context 不得出现目标设备名
-        others = [d for d in DEVICES if d != dev]
+        others = [d for d in devices if d != dev]
         other = rng.choice(others)
         facts = [f"配置记录：{other} 的阈值设定为 {val}。"]
         ctx, gold, span = _block_ctx(rng, facts)
@@ -96,7 +96,7 @@ def gen_sample(rng, family):
                 "evidence_visible_from_round": 1,
                 "stale_block": 2, "gold_block_late": 4}
     if family == "multi_hop":
-        dev2 = rng.choice([d for d in DEVICES if d != dev])
+        dev2 = rng.choice([d for d in devices if d != dev])
         facts = [f"链路表：{dev} 的上行通道绑定到 {dev2}。",
                  f"配置记录：{dev2} 的阈值设定为 {val}。"]
         ctx, gold, span = _block_ctx(rng, facts)
@@ -123,24 +123,33 @@ def main():
     p.add_argument("--seed_val", type=int, default=1042)  # 与 train 不重叠的事实随机流
     args = p.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    deployments = list(range(256))
+    random.Random(0).shuffle(deployments)
+    groups = {"train": deployments[:192], "val": deployments[192:]}
+    used = {"train": set(), "val": set()}
     with open(args.out, "w", encoding="utf-8") as f:
         for split, seed in (("train", args.seed_train), ("val", args.seed_val)):
             rng = random.Random(seed)
             for fam in FAMILIES:
                 for _ in range(args.n_per_family):
-                    rec = gen_sample(rng, fam)
+                    site = rng.choice(groups[split])
+                    devices = [f"{base}-{site:03d}" for base in DEVICES]
+                    rec = gen_sample(rng, fam, devices)
+                    rec["deployment_id"] = site
+                    used[split].add(site)
                     rec["family"] = fam
                     rec["split"] = split
                     # 真值自检（评审 7.3）：irrelevant 不得泄漏目标设备
                     if fam == "irrelevant":
                         q = rec.get("question", "")
                         # question 含目标设备名是合法的；context 不得含
-                        dev_tok = [d for d in DEVICES if d in q]
+                        dev_tok = [d for d in devices if d in q]
                         for d in dev_tok:
                             assert d not in rec.get("context", ""), f"irrelevant 泄漏 {d}"
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(f"written {2 * len(FAMILIES) * args.n_per_family} samples "
-          f"(train/val 事实流隔离) -> {args.out}")
+          f"(train groups={len(used['train'])}, val groups={len(used['val'])}, "
+          f"overlap={len(used['train'] & used['val'])}) -> {args.out}")
 
 
 if __name__ == "__main__":

@@ -73,14 +73,17 @@ class QSARetriever(nn.Module):
         topk_f = topk_fine or cfg.topk_fine
         q = self.project_query(query_hidden)                      # [B,d]
         coarse = self.coarse_scores(q, store)                     # [B,n]
-        n = coarse.shape[1]
+        if store.block_visible_from is not None:
+            hidden = store.block_visible_from[:store.n_blocks] > store.round
+            coarse = coarse.masked_fill(hidden.to(coarse.device), -torch.inf)
+        n = store.visible_count
         topk_c = min(topk_c, n)
         cand_idx = coarse.topk(topk_c, dim=-1).indices            # [B,c]
         # ---- Fine：候选块 token 级 max-sim 重排 ----
         cand_hidden = store.get_block_hidden(model, cand_idx)     # [B,c,block,d]
         tok_sim = torch.einsum("bd,bckd->bck", F.normalize(q, dim=-1),
                                F.normalize(cand_hidden, dim=-1))
-        fine_scores = tok_sim.max(dim=-1).values                   # [B,c]
+        fine_scores = tok_sim.masked_fill(~store.token_mask(cand_idx), -torch.inf).amax(-1)                   # [B,c]
         topk_f = min(topk_f, topk_c)
         k = fine_scores.topk(topk_f, dim=-1).indices               # [B,k]（cand 内下标）
         final_idx = cand_idx.gather(1, k)                          # [B,k] 全局块号

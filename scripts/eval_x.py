@@ -8,9 +8,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import torch
 from transformers import AutoTokenizer, TextStreamer
 
-from model.minimind_x import MiniMindXConfig, MiniMindXForCausalLM
 from model.minimind_x.controller import AdaptiveController
-from trainer.x_utils import x_weight_path, tokenize_tensors
+from trainer.x_utils import bind_x_tokenizer, load_x_for_eval, tokenize_tensors
 from trainer.trainer_utils import setup_seed
 import random
 
@@ -24,8 +23,8 @@ def main():
     p.add_argument("--tokenizer_path", type=str, default="../model")
     p.add_argument("--variant", type=str, default="minimind_x")
     p.add_argument("--preset", type=str, default=None)
-    p.add_argument("--hidden_size", type=int, default=768)
-    p.add_argument("--num_hidden_layers", type=int, default=8)
+    p.add_argument("--hidden_size", type=int, default=None)
+    p.add_argument("--num_hidden_layers", type=int, default=None)
     p.add_argument("--mode", type=str, default=None, choices=["fast", "normal", "deep"],
                    help="推理模式（None=自适应 halting）")
     p.add_argument("--fixed_loops", type=int, default=None, help="固定 R（覆盖模式）")
@@ -39,14 +38,13 @@ def main():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
-    cfg = MiniMindXConfig(preset=args.preset, variant=args.variant,
-                          **{k: v for k, v in dict(hidden_size=args.hidden_size,
-                                                   num_hidden_layers=args.num_hidden_layers).items() if v is not None})
-    model = MiniMindXForCausalLM(cfg)
-    model.load_state_dict(torch.load(x_weight_path(args.weight_dir, args.weight, cfg.hidden_size),
-                                     map_location="cpu"), strict=False)
-    model = model.half().eval().to(args.device)
+    model = load_x_for_eval(args.weight_dir, args.weight, device=args.device,
+                            hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
+                            variant=args.variant, preset=args.preset)
+    if torch.device(args.device).type == "cuda":
+        model.half()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    bind_x_tokenizer(model, tokenizer)
     ctrl = AdaptiveController(model) if args.context_file else None
     context_ids = None
     if args.context_file:

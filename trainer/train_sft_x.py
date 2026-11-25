@@ -20,7 +20,6 @@ import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
-from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -30,33 +29,33 @@ from model.minimind_x.controller import AdaptiveController
 from dataset.lm_dataset import SFTDataset
 from dataset.retrieval_qa_dataset import RetrievalQADataset, collate_retrieval_qa
 from trainer.trainer_utils import (get_lr, Logger, is_main_process, init_distributed_mode,
-                                   setup_seed, lm_checkpoint)
+                                   setup_seed)
 from trainer.x_utils import (init_model_x, save_x_checkpoint, set_gradient_checkpointing,
                              build_optimizer, validate_config)
 from trainer.residual_schedule import residual_progress, apply_residual_progress
-from trainer.oracle_labels import (sweep_depth, oracle_depth_from_losses, sweep_budget,
-                                   oracle_budget_from_matrix, sweep_retrieval)
+from trainer.oracle_labels import (oracle_depth_from_losses, sweep_budget,
+                                   oracle_budget_from_matrix)
 
 warnings.filterwarnings('ignore')
 
 
 def sft_a_step(input_ids, labels):
     """R=1 固定（SFT-A）。"""
-    res = model(input_ids, labels=labels, num_loops=1)
+    res = model(input_ids, labels=labels, num_loops=1, collect_routers=False)
     return res.loss + res.aux_loss, {"loss": res.loss.item()}
 
 
 def sft_b_step(input_ids, labels):
     """随机深度弹性（SFT-B）：本 step 采样 R；按概率切换全展开做 router 无关的一致性监督。"""
     if random.random() < args.full_unroll_ratio:
-        res = model(input_ids, labels=None, collect_exits=True)
+        res = model(input_ids, labels=None, collect_exits=True, collect_routers=False)
         lm, per_exit = lm_loss_per_exit(res.exit_logits, labels, "uniform")
         loss = lm + res.aux_loss
         if args.alpha_consistency > 0:
             loss = loss + args.alpha_consistency * consistency_kl_loss(res.exit_logits, labels)
         return loss, {"loss": lm.item(), "per_exit": [round(l.item(), 4) for l in per_exit]}
     r = random.randint(1, lm_config.max_loop)
-    res = model(input_ids, labels=labels, num_loops=r)
+    res = model(input_ids, labels=labels, num_loops=r, collect_routers=False)
     return res.loss + res.aux_loss, {"loss": res.loss.item(), "r": r}
 
 
@@ -71,11 +70,44 @@ def assert_sft_c_batch(input_ids):
 
 
 def sft_c_step(batch):
+    return _sft_c_loss(model, batch, args)
+
+
+def _halt_supervision(out, labels, query_len, config, file_depth):
+    """Pair each adaptive decision with the next supervised token at that same prefix."""
+    steps = (out.router_probs or {}).get("halt_by_step")
+    if not steps:
+        return None, None, None
+    skip_prefill = int(getattr(config, "prefill_policy", "fixed_cap") == "fixed_cap")
+    first_pos = query_len - 1 + skip_prefill
+    targets = labels[:, first_pos + 1:]
+    scored = targets.ne(-100)
+    if not scored.any():
+        return None, None, None
+    # Flatten only scored (sample, position) pairs for the existing per-round loss.
+    probs = [p[:, skip_prefill:-1][scored] for p in steps]
+    targets = targets[scored]
+    if file_depth > 0:
+        return probs, torch.full_like(targets, file_depth), None
+    with torch.no_grad():
+        losses, correct = [], []
+        for logits in out.exit_logits:
+            scores = logits[:, first_pos:-1][scored].float()
+            losses.append(torch.nn.functional.cross_entropy(scores, targets, reduction="none"))
+            correct.append(scores.argmax(-1).eq(targets))
+        depth = oracle_depth_from_losses(torch.stack(losses, dim=1), config.oracle_epsilon)
+        resolved = torch.stack(correct, dim=1).any(1)
+    return probs, depth, resolved
+
+
+def _sft_c_loss(model, batch, args):
     """终局 teacher-forcing（SFT-C / Stage 3）：controller + joint loss + 在线 oracle。
 
     V2 改造（T0.1/T0.2/T0.8）：query 因果边界、反事实检索 oracle、全展开 router 概率
     监督、memory 统计只进日志。
     """
+    raw = model.module if isinstance(model, DistributedDataParallel) else model
+    lm_config = raw.config
     assert_sft_c_batch(batch["input_ids"])
     input_ids = batch["input_ids"].to(args.device)
     labels = batch["labels"].to(args.device)
@@ -94,72 +126,55 @@ def sft_c_step(batch):
     if not isinstance(_raw_ret, (list, tuple)):
         _raw_ret = [int(_raw_ret)] if int(_raw_ret) >= 0 else []
     _schema = int(batch["action_schema_version"]) if "action_schema_version" in batch else 1
-    oracle_ret = normalize_oracle_actions(_raw_ret, schema_version=_schema)
+    oracle_ret = normalize_oracle_actions(_raw_ret, schema_version=_schema)[:lm_config.max_loop - 1]
+
+    visibility = batch.get("block_visible_from")
+    def controller_factory():
+        return AdaptiveController(raw, block_visible_from=visibility)
 
     # ---- 在线 oracle（Doc 4 §3：Self-generated Supervision；小采样率）----
-    oracle_r = None
-    halt_valid = None  # T4.4：unresolved（全出口都错）不参与 halt 监督
-    if oracle_r_file > 0:
-        oracle_r = torch.full((input_ids.shape[0],), oracle_r_file, device=args.device)
-    elif random.random() < args.oracle_rate:
-        per_exit_loss, per_exit_correct, _ = sweep_depth(model, input_ids, labels)
-        oracle_r = oracle_depth_from_losses(per_exit_loss, lm_config.oracle_epsilon)
-        halt_valid = per_exit_correct.any(dim=-1)  # 有任一出口全对才算 resolved
+    measure_depth = oracle_r_file <= 0 and random.random() < args.oracle_rate
     # Budget oracle：文件标签缺失时在线 sweep（逐档 loss → B*，Doc 4 §11）；
     # 未采到的批次不监督（budget router 仍按自身 argmax 执行，自洽）
     oracle_budget = None
     if args.train_budget_router and random.random() < args.oracle_rate:
         loss_matrix = sweep_budget(
-            model, input_ids, labels, context_ids,
-            controller_factory=lambda: AdaptiveController(model),
-            query_len=query_len)  # 评审 3.1：预算检索不得读 gold
+            raw, input_ids, labels, context_ids,
+            controller_factory=controller_factory,
+            query_len=query_len, append_only=True)  # 评审 3.1：预算检索不得读 gold
         oracle_budget = int(oracle_budget_from_matrix(loss_matrix, lm_config.oracle_epsilon)[0].item())
     if not oracle_ret and random.random() < args.oracle_rate:
         # T2.5/T4.4：三动作反事实（REUSE/RESCORE_WARM/GLOBAL_REFRESH）；
         # 无 warm cache 的动作 loss=+inf 自动 mask
-        try:
-            from trainer.oracle_labels import sweep_retrieval_action
-            best_a, _ = sweep_retrieval_action(
-                model, input_ids, labels, context_ids, query_len,
-                controller_factory=lambda: AdaptiveController(model))
-            oracle_ret = [int(x) for x in best_a[0].tolist()]
-        except Exception:
-            labels_r, _ = sweep_retrieval(model, input_ids, labels, context_ids, query_len,
-                                          controller_factory=lambda: AdaptiveController(model))
-            oracle_ret = labels_r[0].tolist()  # 回退：旧 0/1 口径
+        from trainer.oracle_labels import sweep_retrieval_action
+        best_a, _ = sweep_retrieval_action(
+            raw, input_ids, labels, context_ids, query_len,
+            controller_factory=controller_factory, budget_idx=oracle_budget, append_only=True)
+        oracle_ret = best_a[0].tolist()
 
-    ctrl = AdaptiveController(model)
-    # P1：周期 rebuild key index（key_refresh_interval>0 时；0=Frozen forever）
-    if getattr(lm_config, "key_refresh_interval", 0):
-        ctrl.begin(context_ids)  # 建库
-        ctrl.maybe_refresh_index(getattr(args, "step_global", 0))
+    ctrl = AdaptiveController(model, block_visible_from=visibility)
     out, extras = ctrl.forward_with_oracles(
         input_ids, None, labels, context_ids, query_len=query_len,
         gold_block_idx=gold_block if (gold_block[0] >= 0).all() else None,
         oracle_retrieve=oracle_ret if oracle_ret else None,
-        oracle_budget=oracle_budget)
-    # T0.2：全展开 router 概率（不再要求 halt=True 才有监督信号）
-    halt_probs = None
-    if (oracle_r is not None and args.train_halt_router
-            and out.router_probs and out.router_probs.get("halt")):
-        halt_probs = out.router_probs["halt"]
+        oracle_budget=oracle_budget, append_only=True)
+    halt_probs = oracle_r = halt_valid = None
+    if measure_depth or (args.train_halt_router and oracle_r_file > 0):
+        halt_probs, oracle_r, halt_valid = _halt_supervision(
+            out, labels, query_len, lm_config, oracle_r_file)
+        if not args.train_halt_router:
+            halt_probs = None
     retrieve_probs = None
     if (oracle_ret and out.router_probs and out.router_probs.get("retrieval")
-            and len(oracle_ret) == len(out.router_probs["retrieval"])):
-        retrieve_probs = out.router_probs["retrieval"]
-    # T2.5：三动作 CE（0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH 的执行口径见 oracle；
-    # 训练标签统一为 0=REUSE / 1=RESCORE_WARM / 2=GLOBAL_REFRESH 时用 action CE）
-    ret_action_logits = None
-    ret_action_masks = None
-    oracle_ret_action = None
-    if (oracle_ret and out.router_probs and out.router_probs.get("retrieval_action")
-            and len(oracle_ret) == len(out.router_probs["retrieval_action"])):
-        ret_action_logits = out.router_probs["retrieval_action"]
-        warm_ok = bool(extras.get("warm_available", True))
-        n = len(ret_action_logits)
+            ):
+        retrieve_probs = out.router_probs["retrieval"][:len(oracle_ret)]
+    ret_action_logits = ret_action_masks = oracle_ret_action = None
+    if oracle_ret and out.router_probs and out.router_probs.get("retrieval_action"):
+        ret_action_logits = out.router_probs["retrieval_action"][:len(oracle_ret)]
+        decisions = [rec for rec in extras["trajectory"] if "round" in rec]
         from model.minimind_x.router.retrieval_router import action_mask
-        ret_action_masks = [action_mask(warm_ok, device=ret_action_logits[0].device,
-                                        batch=ret_action_logits[0].shape[0]) for _ in range(n)]
+        ret_action_masks = [action_mask(rec["warm_available"], device=input_ids.device)
+                            for rec in decisions[:len(ret_action_logits)]]
         # 标签已是 schema v2，禁止再对调（评审 4.1）
         oracle_ret_action = torch.tensor(oracle_ret, device=args.device, dtype=torch.long)
     # 二值 retrieve BCE（兼容旧路径）：标签 = 是否离开 REUSE
@@ -181,11 +196,13 @@ def sft_c_step(batch):
                        retrieval_actions=(oracle_ret_action if oracle_ret_action is not None
                                           else None),
                        cost_weight=getattr(lm_config, "lambda_cost", 0.0))
-    zero = next(model.parameters()).new_zeros(())
-    loss = parts["loss"] + zero + extras.get("retrieval_ce", zero)
+    loss = parts["loss"] + extras.get("retrieval_ce", 0.0)
     if "distill_loss" in extras and args.lambda_distill > 0:
         loss = loss + args.lambda_distill * extras["distill_loss"]
-    return loss, {"loss": parts["loss"].item(),
+    return loss, {"depth_assessed": halt_valid.numel() if halt_valid is not None else 0,
+                  "unresolved": int((~halt_valid).sum()) if halt_valid is not None else 0,
+                  "budget_idx": lm_config.memory_budgets.index(extras["budget_cap_tokens"]),
+                  "loss": parts["loss"].item(),
                   "retrievals": extras["retrievals"],
                   "memory_tokens": extras["memory_tokens"],
                   "budget_cap/actual/unique": (extras.get("budget_cap_tokens", 0),
@@ -232,18 +249,21 @@ def main():
                         help="fine→coarse 检索蒸馏系数（v1.3；0 关闭）")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl",
                         help="SFT-A/B 数据（官方 sft_t2t_mini，conversations 格式）")
+    parser.add_argument("--max_context_tokens", type=int, default=None, help="Optional external document token cap")
     parser.add_argument("--retrieval_data_path", type=str,
                         default="../dataset/retrieval_qa.jsonl", help="SFT-C 数据")
-    parser.add_argument('--from_weight', default='pretrain_x', type=str)
+    parser.add_argument('--from_weight', default=None, type=str)
     parser.add_argument("--tokenizer_path", type=str, default="../model",
                         help="tokenizer 目录（从仓库根目录运行时传 model/）")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-X-SFT")
     parser.add_argument("--grad_ckpt", default=1, type=int, choices=[0, 1])
     args = parser.parse_args()
+    if args.from_weight is None:
+        args.from_weight = {"a": "pretrain_x", "b": "sft_x_a", "c": "sft_x_b"}[args.phase]
 
-    local_rank = init_distributed_mode()
-    if dist.is_initialized():
+    local_rank = init_distributed_mode(args.device)
+    if dist.is_initialized() and torch.device(args.device).type == "cuda":
         args.device = f"cuda:{local_rank}"
     setup_seed(42)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -260,12 +280,15 @@ def main():
     model, tokenizer = init_model_x(lm_config, args.from_weight,
                                     tokenizer_path=args.tokenizer_path,
                                     save_dir=args.save_dir, device=args.device)
+    lm_config = model.config
     model.train()
+    if args.phase == "c":
+        lm_config.use_budget_router = bool(args.train_budget_router)
     if args.grad_ckpt == 1:
         set_gradient_checkpointing(model, True)
     # T0.5（C9 修复）：DDP 包装与数据分片（routers/manager 按阶段激活 → find_unused）
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank],
+        model = DistributedDataParallel(model, device_ids=[local_rank] if device_type == "cuda" else None,
                                         broadcast_buffers=False,
                                         find_unused_parameters=True)
 
@@ -275,12 +298,12 @@ def main():
         wandb.init(project=args.wandb_project, name=f"SFT-{args.phase}")
 
     if args.phase in ("a", "b"):
-        ds = SFTDataset(args.data_path, tokenizer, max_length=1024)
+        ds = SFTDataset(args.data_path, tokenizer, max_length=min(1024, lm_config.max_position_embeddings))
         collate = None
     else:
         ds = RetrievalQADataset(args.retrieval_data_path, tokenizer,
-                                max_context_tokens=lm_config.max_position_embeddings,
-                                block_size=lm_config.block_size)
+                                max_context_tokens=args.max_context_tokens,
+                                block_size=lm_config.block_size, split="train")
         collate = collate_retrieval_qa
         assert lm_config.use_retrieval and lm_config.use_memory, "SFT-C 需要 minimind_x 变体"
     train_sampler = DistributedSampler(ds) if dist.is_initialized() else None
@@ -290,10 +313,12 @@ def main():
     optimizer = build_optimizer(model, lr=args.learning_rate)  # T4.3 参数组
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     iters = len(loader) * args.epochs
+    depth_counts = torch.zeros(4 + len(lm_config.memory_budgets), device=args.device, dtype=torch.long)
     step_global = 0
     for epoch in range(args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         t0 = time.time()
+        end_step = min(len(loader), args.max_steps - step_global) if args.max_steps > 0 else len(loader)
         for step, batch in enumerate(loader, 1):
             step_global += 1
             lr = get_lr(step_global, iters, args.learning_rate)
@@ -306,19 +331,25 @@ def main():
                     Logger(f'residual warm-up: step={step_global} frac={frac:.3f} '
                            f'eta={eta:.3f} lambda={lam:.3f}')
 
-            if args.phase == "a":
-                input_ids, labels = batch[0].to(args.device), batch[1].to(args.device)
-                with autocast_ctx:
-                    loss, info = sft_a_step(input_ids, labels)
-            elif args.phase == "b":
-                input_ids, labels = batch[0].to(args.device), batch[1].to(args.device)
-                with autocast_ctx:
-                    loss, info = sft_b_step(input_ids, labels)
-            else:
-                with autocast_ctx:
+            with autocast_ctx:
+                if args.phase == "c":
                     loss, info = sft_c_step(batch)
-            scaler.scale(loss / args.accumulation_steps).backward()
-            if step % args.accumulation_steps == 0:
+                else:
+                    ids, labels = (t.to(args.device) for t in batch)
+                    if args.phase == "a":
+                        loss, info = sft_a_step(ids, labels)
+                    else:
+                        loss, info = sft_b_step(ids, labels)
+            window_start = (step - 1) // args.accumulation_steps * args.accumulation_steps
+            window_size = min(args.accumulation_steps, end_step - window_start)
+            if args.phase == "c":
+                depth_counts[0] += info["depth_assessed"]
+                depth_counts[1] += info["unresolved"]
+                depth_counts[2] += int(batch["gold_truncated"].any())
+                depth_counts[3] += int(batch["gold_block"][0] >= 0 or batch["gold_truncated"].any())
+                depth_counts[4 + info["budget_idx"]] += info["unresolved"]
+            scaler.scale(loss / window_size).backward()
+            if step == window_start + window_size:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
@@ -335,12 +366,21 @@ def main():
                 break
         if args.max_steps > 0 and step_global >= args.max_steps:
             break
+    if dist.is_initialized():
+        dist.all_reduce(depth_counts)
+    assessed, unresolved, truncated, annotated, *budgets = depth_counts.tolist()
+    sft_metrics = dict(depth_unit="next_token_decisions", depth_assessed=assessed, unresolved=unresolved,
+                       unresolved_fraction=unresolved / assessed if assessed else None,
+                       unresolved_budget_hist=budgets, truncated_gold_samples=truncated, annotated_gold_samples=annotated,
+                       truncated_gold_fraction=truncated / annotated if annotated else None)
+    if args.phase == "c":
+        Logger(f"SFT-C evidence metrics {sft_metrics}")
     # 评审 9.1：max_steps / 正常跑完都必须落盘（原先 break 后跳过保存）
     if is_main_process():
         save_x_checkpoint(  # T5.2：完整 checkpoint
             model, args.save_dir, f'{args.save_weight}_{args.phase}',
             lm_config.hidden_size, optimizer=optimizer, scaler=scaler,
-            extra={"data_progress": {"epoch": epoch + 1 if "epoch" in dir() else 0,
+            extra={"evidence_metrics": sft_metrics, "data_progress": {"epoch": epoch + 1 if "epoch" in dir() else 0,
                                      "step_global": step_global},
                    "warmup_progress": getattr(args, "residual_warmup_steps", 0),
                    "tokenizer_manifest": {"path": args.tokenizer_path},

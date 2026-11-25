@@ -73,6 +73,7 @@ def sweep_depth(model, input_ids, labels, attention_mask=None, memory_kv_per_lay
 
     返回 (per_exit_loss [B,R], per_exit_correct [B,R], exit_logits)。
     """
+    model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     cfg = model.config
     r_max = num_loops or cfg.max_loop
     out = model(input_ids, attention_mask=attention_mask, labels=None,
@@ -92,14 +93,16 @@ def sweep_budget(model, input_ids, labels, context_ids, controller_factory,
     """
     if query_len is None:
         raise ValueError("sweep_budget 必须传 query_len（禁止默认全序列，防 gold 泄漏进检索）")
+    model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     cfg = model.config
     idxs = budget_idxs if budget_idxs is not None else list(range(len(cfg.memory_budgets)))
     losses = []
     for idx in idxs:
         ctrl = controller_factory()
-        out, _ = ctrl.forward_with_oracles(
-            input_ids, attention_mask, labels, context_ids,
-            oracle_budget=idx, query_len=query_len, **oracle_kwargs)
+        with torch.random.fork_rng(devices=[input_ids.device] if input_ids.is_cuda else []):
+            out, _ = ctrl.forward_with_oracles(
+                input_ids, attention_mask, labels, context_ids,
+                oracle_budget=idx, query_len=query_len, **oracle_kwargs)
         losses.append(_per_sample_ce(out.exit_logits[-1], labels))
     return torch.stack(losses, dim=-1)  # [B, n]
 
@@ -117,6 +120,7 @@ def sweep_retrieval(model, input_ids, labels, context_ids, query_len,
     全程因果：两次检索 query 都只含 input_ids[:, :query_len]，gold 后缀不参与。
     返回 (labels_r [B,R] 0/1, gain [B,R])。
     """
+    model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     cfg = model.config
     r_max = num_loops or cfg.max_loop
     causal = input_ids[:, :query_len]
@@ -154,71 +158,33 @@ def sweep_retrieval(model, input_ids, labels, context_ids, query_len,
 
 @torch.no_grad()
 def sweep_retrieval_action(model, input_ids, labels, context_ids, query_len,
-                           controller_factory, attention_mask=None, num_loops=None):
+                           controller_factory, attention_mask=None, num_loops=None,
+                           budget_idx=None, append_only=False):
     """T2.5/T4.4 同快照三动作反事实（评审 4.2 修复）。
 
     从**同一状态快照**（相同 H/W/Warm Cache/可见前缀）分叉三动作，比较**动作之后**
     的出口 loss——不是三条全程独立轨迹，也不是「第 r 轮 exit 给第 r 轮后动作」打分。
 
     动作 id（schema v2）：0=REUSE, 1=RESCORE_WARM, 2=GLOBAL_REFRESH。
-    返回 (best_action [B,R], loss_matrix [B,R,3])。
+    返回 (best_action [B,R-1], loss_matrix [B,R-1,3])。
     """
-    from model.minimind_x.router.retrieval_router import (
-        ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH)
-
-    cfg = model.config
-    r_max = num_loops or cfg.max_loop
-    causal = input_ids[:, :query_len]
-    causal_mask = attention_mask[:, :query_len] if attention_mask is not None else None
-    B = input_ids.shape[0]
-
-    def _mem_kw(ctrl):
-        mem_in = ctrl._memory_input()
-        if getattr(ctrl.cfg, "residual_v2", False):
-            return {"memory_payload": mem_in}
-        return {"memory_kv_per_layer": mem_in}
-
-    # --- 共享前缀：初始检索后，跑到各决策点 ---
-    # 对每个决策轮 r（0..r_max-2，动作影响的是 r 之后的出口）：
-    #   用 oracle 全 REUSE 跑到产生 exit[r]（即 r+1 个 exit）得到快照
-    #   分叉动作，继续到 r_max，比较 exit[r+1] 的 CE
-    loss_matrix = input_ids.new_zeros(B, r_max, 3, dtype=torch.float32)
-    loss_matrix = torch.zeros(B, r_max, 3, device=input_ids.device)
-    for r_decision in range(r_max):
-        # 共享轨迹：到 r_decision 轮结束（含 exit[r_decision]）均 REUSE
-        # 分叉后看 exit[min(r_decision+1, r_max-1)]（动作在 cb 中于 r_decision 后执行）
-        eval_round = min(r_decision + 1, r_max - 1)
-        for a_id in (ACTION_REUSE, ACTION_RESCORE_WARM, ACTION_GLOBAL_REFRESH):
+    cfg = getattr(model, "module", model).config
+    rounds = (num_loops or cfg.max_loop) - 1
+    if input_ids.size(0) != 1:
+        raise ValueError("Retrieval oracle requires one external store per sample")
+    matrix = torch.full((1, rounds, 3), torch.inf, device=input_ids.device)
+    prefix = []
+    for r in range(rounds):
+        for action in range(3):
             ctrl = controller_factory()
-            ctrl.begin(context_ids)
-            q = ctrl.raw.model.prelude_hidden(causal, causal_mask)
-            ctrl.memory = ctrl.retrieve_into_memory(q)
-            if a_id == ACTION_RESCORE_WARM and not ctrl.has_warm_cache():
-                loss_matrix[:, r_decision, a_id] = float("inf")
+            with torch.random.fork_rng(devices=[input_ids.device] if input_ids.is_cuda else []):
+                out, extra = ctrl.forward_with_oracles(
+                    input_ids, attention_mask, labels, context_ids, query_len=query_len,
+                    oracle_budget=budget_idx, distill=False, append_only=append_only,
+                    oracle_retrieve=[*prefix, action] + [0] * (cfg.max_loop - r - 2))
+            decisions = [e for e in extra["trajectory"] if "round" in e]
+            if action == 1 and not decisions[r]["warm_available"]:
                 continue
-
-            def make_cb(r_decision=r_decision, a_id=a_id, ctrl=ctrl):
-                def cb(r, exit_hidden):
-                    vis = exit_hidden[:, :query_len] if query_len else exit_hidden
-                    # 决策点之前：REUSE（保持共享前缀状态）；决策点：执行目标动作
-                    if r < r_decision:
-                        return None
-                    if r == r_decision:
-                        if a_id == ACTION_REUSE:
-                            return None
-                        with torch.no_grad():
-                            ctrl.memory = ctrl.execute_retrieval_action(
-                                a_id, vis, budget_idx=ctrl._budget_idx(vis),
-                                mem=ctrl.memory)
-                            return ctrl._memory_input()
-                    return None  # 之后 REUSE
-                return cb
-
-            out = model(input_ids, attention_mask=attention_mask, labels=None,
-                        collect_exits=True, num_loops=r_max,
-                        loop_callback=make_cb(), **_mem_kw(ctrl))
-            # 评价出口 = 动作生效后的第一出口（评审 4.2：不能拿动作前的 exit 给动作打分）
-            ce = _per_sample_ce(out.exit_logits[eval_round], labels)  # [B]
-            loss_matrix[:, r_decision, a_id] = ce
-    best = loss_matrix.argmin(dim=-1)  # [B,R]
-    return best.to(input_ids.device), loss_matrix.to(input_ids.device)
+            matrix[:, r, action] = _per_sample_ce(out.exit_logits[r + 1], labels)
+        prefix.append(int(matrix[0, r].argmin()))
+    return matrix.argmin(-1), matrix
